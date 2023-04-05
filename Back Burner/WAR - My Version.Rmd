@@ -1,0 +1,52 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+# Init
+
+```{r}
+
+library(tidyverse)
+library(rlang)
+library(glue)
+library(nflreadr)
+
+```
+
+```{r}
+
+# Get PBP
+data <- nflreadr::load_pbp(2022) %>%
+  nflfastR::clean_pbp() %>%
+  as_tibble() %>%
+   # Setting Filters
+  filter(play == 1,
+         two_point_attempt == 0,
+         extra_point_attempt == 0,
+         aborted_play == 0,
+         !str_detect(desc,'No Play')) %>%
+  filter(week <= 17)
+
+# Get Player Data for GUIDs
+players <- nflreadr::load_players() %>%
+  as_tibble()
+
+```
+
+```{r}
+
+# Pipeline Plan
+
+# 1. Take data with variables, outcome and gsis of player responsible
+# 2. Take argument for 
+
+
+```
+
+
+
+
+

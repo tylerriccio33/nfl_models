@@ -1,0 +1,2 @@
+condition,weight
+down == 1 | down == 2,1.4000000000000001

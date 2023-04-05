@@ -1,0 +1,2 @@
+condition,weight
+posteam == home_team,0.9500000000000001

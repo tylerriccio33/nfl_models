@@ -1,0 +1,2 @@
+condition,weight
+fumble == 1 & sack == 0,0.6000000000000001

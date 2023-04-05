@@ -1,0 +1,2 @@
+condition,weight
+yards_gained > 50,0.15000000000000002

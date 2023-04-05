@@ -1,0 +1,124 @@
+---
+title: "WAR Version 2"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Initialization
+
+```{r}
+library(tidyverse)
+library(rlang)
+library(glue)
+```
+
+```{r}
+data <- nflreadr::load_pbp(2022) %>%
+  nflfastR::clean_pbp()
+players <- nflreadr::load_players()
+participation <- nflreadr::load_participation()
+```
+
+# Formatting Positions
+
+Each play receives a GSIS for the passer, rusher and receiver. For this initial concept, each play will also receive a corner GSIS.
+
+```{r}
+
+model_data <- data %>%
+  select(
+    # IDs or general
+    play_id,
+    game_id,
+    posteam,
+    location,
+    desc,
+    passer_id,
+    receiver_id = receiver_player_id,
+    # Play characteristics
+    no_huddle,
+    qb_hit,
+    qb_dropback,
+    xpass,
+    # Pass characteristics
+    pass_location,
+    pass_length,
+    air_epa,
+  ) %>%
+  # Join to participation
+  left_join(
+    select(
+      participation,
+      game_id = nflverse_game_id,
+      play_id,
+      offense_formation,
+      defenders_in_box,
+      number_of_pass_rushers,
+      defense_players
+    ),
+    by = c('game_id', 'play_id')
+  ) %>%
+  # Expand defensive players
+  separate_rows(defense_players, sep = ';')
+
+
+model_data
+
+
+
+
+
+  # Join to positions and GSIS
+  left_join(
+    select(players, display_name, gsis = gsis_id, position) %>% distinct(),
+    by = c('defense_players' = 'gsis')
+  ) %>%
+  left_join(
+    select(players, gsis = gsis_id, receiver_position = position) %>% distinct(),
+    by = c('receiver_id' = 'gsis')
+  ) %>%
+  # Filter to CB
+  filter(position == 'CB',
+         receiver_position == 'WR') %>%
+  # Drop NA
+  drop_na(play_id, game_id, posteam, air_epa) %>%
+  # Filter Non-CB Plays
+  filter(pass_location != 'middle',
+         qb_dropback == 1, ) %>%
+  select(-c(play_id, game_id, position, receiver_position))
+
+```
+
+# Fit a Model
+
+```{r}
+
+# Fit Model
+model_fit <- lme4::lmer(
+  epa ~ location + offense_formation + no_huddle + qb_hit +
+    pass_location + xpass +
+    (1 |
+       passer_id)  + (1 |
+                        posteam) + (1 | defense_players),
+  data = model_data
+) %>%
+  lme4::ranef()
+
+model_fit$defense_players %>%
+  mutate(id = rownames(.)) %>%
+  rename(ipa = `(Intercept)`) %>%
+  as_tibble() %>%
+  left_join(select(players, display_name, gsis_id) , by = c('id' = 'gsis_id')) %>%
+  arrange(-ipa)
+
+```
+
+
+
+
+
+
+
+
+
+

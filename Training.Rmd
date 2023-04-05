@@ -1,0 +1,563 @@
+---
+title: "Model Training"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+
+library(tabulaR)
+library(rlang)
+library(tidyverse)
+library(finetune)
+library(ggrepel)
+library(tidymodels)
+library(rules)
+library(baguette)
+library(broom)
+library(corrr)
+library(colino)
+library(doParallel)
+library(tidy.outliers)
+tidymodels_prefer()
+options(scipen = 999)
+
+data <- read_csv('interacted.csv') %>%
+  # Remember there is some wierd issue with the NFL API 
+  # The rows effected tend to have missing points
+  drop_na(starts_with('id_'), starts_with('outcome_'), points) %>%
+  # ERA sometimes isn't factorized
+  mutate(era = as.factor(era)) %>%
+  # Remove first year
+  filter(id_season > 2006)
+
+data %>% check_na()
+
+unregister <- function() {
+  env <- foreach:::.foreachGlobals
+  rm(list=ls(name=env), pos=env)
+}
+unregister()
+
+# Parallel
+all_cores <- parallel::detectCores(logical = FALSE)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+```
+
+# Sequential Feature Selection
+
+```{r}
+
+library(scales)
+
+log_feature_effect <- function(data) {
+  
+  features <- data %>%
+    select(-res) %>%
+    colnames()
+  
+  # Splits
+  data_split <- initial_split(data, strata = res)
+  data_train <- training(data_split)
+  data_test <- testing(data_split)
+  
+  # Resamples
+  data_resamples <- vfold_cv(data_train,
+                             v = 50,
+                             strata = res)
+  
+  # Build Recipes
+  recipe_list <- vector(mode = 'list', length = length(features))
+  initial_rec <- recipe(res ~ ., data = data_train)
+
+  for (i in 1:length(recipe_list)) {
+
+    selection <- features[i] %>%
+      sym()
+    
+    recipe_list[[i]] <- initial_rec %>%
+      step_select(-{{selection}})
+    
+  }
+  
+  recipe_list[[length(recipe_list)+1]] <- initial_rec
+  
+  features[length(features)+1] <- 'baseline'
+
+  # Model spec
+  mod_spec <- bag_tree() %>%
+    set_mode('regression')
+
+  # Set
+  set <- workflow_set(preproc = recipe_list,
+                      models = list(mod_spec))
+  
+  # Fit Resamples
+  fit_results <- set %>%
+    workflow_map('fit_resamples',
+                 seed = 22,
+                 resamples = data_resamples)
+  
+  # Change Names
+  fit_results[,'wflow_id'] <- features
+  
+  return(fit_results)
+  
+}
+
+feature_fits <- data %>%
+  # IDs
+  select(-c(
+    game_id,
+    posteam,
+    div_game,
+    playoff,
+    defteam,
+    season,
+    week,
+    season
+  )) %>%
+  # Home
+  select(-site) %>%
+  # Priors
+  select(-c(spread_line, moneyline, vegas_x_points, elo)) %>%
+  # select(res, qb_dakota_1, qb_starts_1, contains('pythag')) %>%
+  log_feature_effect()
+
+feature_fits
+
+feature_fits %>%
+  collect_metrics(summarize = F)  %>%
+  filter(.metric == 'rmse') %>%
+  select(wflow_id, fold = id, rmse = .estimate) %>%
+  inner_join(
+    x = .,
+    y = filter(., wflow_id == 'baseline') %>%
+      select(fold, baseline = rmse) %>%
+      unique(),
+    by = c('fold')
+  ) %>% 
+  # Remove Baseline
+  mutate(
+    above_baseline = round(rmse - baseline, digits = 4),
+    pct_improvement = (rmse - baseline) / baseline * 100
+  ) %>%
+  mutate(rmse = round(rmse, digits = 4),
+         wflow_id = str_replace_all(wflow_id, '_',' ') %>% str_to_title(),
+         wflow_id = fct_reorder(wflow_id, pct_improvement))  %>%
+  group_by(wflow_id) %>%
+  summarize(improvement = round(mean(pct_improvement), 4)) %>%
+  # Plot
+  ggplot(aes(wflow_id, improvement, label = improvement, fill = wflow_id)) +
+  # Line
+  geom_col() +
+  scale_x_discrete(labels = label_wrap(1)) +
+  geom_label_repel() +
+  # Highlight Baseline
+  geom_hline(yintercept = 0, color = 'red') +
+  # Theme
+  ggthemes::theme_fivethirtyeight()
+
+# Bayes
+bayes_analysis <- tidyposterior::perf_mod(
+  feature_fits,
+  hetero_var = T,
+  seed = 4,
+  refresh = 0
+)
+
+autoplot(bayes_analysis)
+
+autoplot(bayes_analysis, size = .02, type = 'ROPE') +
+  geom_label_repel(aes(label = workflow))
+
+tidyposterior::contrast_models(bayes_analysis) %>%
+  autoplot(size = 0.02)
+
+```
+
+```{r}
+
+library(vip)
+
+t_data <- data %>%
+  # IDs
+  select(-c(
+    game_id,
+    posteam,
+    div_game,
+    playoff,
+    defteam,
+    season,
+    week,
+    season
+  )) %>%
+  # Home
+  select(-site) %>%
+  # Priors
+  select(-c(spread_line, moneyline, vegas_x_points, elo))
+
+base_model <- rand_forest() %>%
+  set_mode('regression') %>%
+  set_engine('ranger', importance = 'impurity') %>%
+  fit(res ~ ., data = t_data)
+  
+base_model %>%
+  vip(num_features = ncol(t_data) - 1)
+
+```
+
+```{r}
+
+t_data <- data %>%
+  # IDs
+  select(-c(
+    game_id,
+    posteam,
+    div_game,
+    playoff,
+    defteam,
+    season,
+    week,
+    season
+  )) %>%
+  # Home
+  select(-site) %>%
+  # Priors
+  select(-c(spread_line, moneyline, vegas_x_points, elo))
+
+sfs_backwards_mod <- function(data, k = NULL) {
+  
+  feature_set <- data %>%
+    select(-res) %>%
+    colnames()
+  
+  # Initialize a data frame to store feature effects
+  feature_effects <- data.frame(feature = character(), 
+                                effect = numeric(), 
+                                stringsAsFactors = FALSE)
+  
+  while (length(feature_set) > 0) {
+    current_best_feature <- NULL
+    current_best_score <- -Inf
+    
+    # Iterate through each feature in the current feature set
+    for (feature in feature_set) {
+      # Remove the feature from the data set
+      temp_data <- select(data, -all_of(feature))
+      
+      print(feature)
+      # Fit the model on the modified data set
+      temp_model <- decision_tree() %>%
+        set_mode('regression') %>%
+        fit(res ~ ., data = temp_data) %>%
+        predict(new_data = temp_data)
+      
+      # Evaluate the model's performance
+      
+      temp_score <-
+        rmse_vec(truth = temp_data$res, estimate =  temp_model$.pred)
+            
+
+      if (temp_score > current_best_score) {
+        current_best_feature <- feature
+        current_best_score <- temp_score
+      }
+    }
+    
+    # Add the feature effect to the data frame
+    feature_effects <- rbind(feature_effects, 
+                             data.frame(feature = current_best_feature, 
+                                        effect = current_best_score, 
+                                        stringsAsFactors = FALSE))
+    
+    # Remove the feature from the feature set
+    feature_set <- feature_set[feature_set != current_best_feature]
+    if(!is.null(k) && nrow(feature_effects) == k) break
+  }
+  
+  return(feature_effects)
+  
+}
+
+feature_scores <-  t_data %>%
+  sfs_backwards_mod()
+
+feature_scores
+
+
+sfs_backwards_mod <- function(data, k = NULL) {
+  
+  feature_set <- data %>%
+    select(-res) %>%
+    colnames()
+  
+  # Initialize a data frame to store feature effects
+  feature_effects <- data.frame(feature = character(), 
+                                effect = numeric(), 
+                                stringsAsFactors = FALSE)
+  
+  # Fit the model on the full data set
+  full_model <- decision_tree() %>%
+    set_mode('regression') %>%
+    fit(res ~ ., data = data)
+  full_model_pred <- full_model %>% 
+    predict(new_data = data)
+  full_score <- rmse_vec(truth = data$res, estimate = full_model_pred$.pred)
+  
+  # return(full_model_pred)
+  
+  for (i in feature_set) {
+    
+    # Remove the feature from the data set
+    temp_data <- data %>%
+      select(-all_of(feature_set[i]))
+    
+    # Fit the model on the modified data set
+    temp_model <- decision_tree() %>%
+      set_mode('regression') %>%
+      fit(res ~ ., data = temp_data) %>%
+      predict(new_data = temp_data)
+    
+    temp_score <-
+      rmse_vec(truth = temp_data$res, estimate = temp_model$.pred)
+    
+    return(temp_score)
+      
+      # Calculate the change in performance
+      feature_effect <- full_score - temp_score
+      
+      # Add the feature effect to the data frame
+      feature_effects <- rbind(feature_effects, 
+                               data.frame(feature = feature, 
+                                          effect = feature_effect, 
+                                          stringsAsFactors = FALSE))
+      
+      if(!is.null(k) && nrow(feature_effects) == k) break
+  }
+  
+  return(feature_effects)
+  
+}
+
+feature_scores <-  t_data %>%
+  sfs_backwards_mod()
+
+feature_scores
+
+
+```
+
+
+
+# Split and Fold
+
+```{r}
+
+# Splits
+set.seed(1)
+data_split <- initial_split(data, strata = starts_with('outcome_'))
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+# Folds
+set.seed(2)
+data_folds <- vfold_cv(data_train, strata = starts_with('outcome_'), v = 10, repeats = 2)
+
+```
+
+# Define Recipes
+
+```{r}
+
+# Recipes
+rec <- recipe(outcome_sr ~ ., data = data_train) %>%
+  update_role(starts_with('id_'),
+              new_role = 'id') %>%
+  # Impute QB Stats first
+  step_impute_bag(qb_pacr, qb_dakota, qb_cpoe, impute_with = imp_vars(qb_elo, qb_starts)) %>%
+  # Impute WR Stats next
+  step_impute_linear(
+    cushion,
+    separation,
+    percent_share_of_intended_air_yards,
+    impute_with = imp_vars(sr, pass_wepa)
+  ) %>%
+  step_impute_linear(
+    intended_air_yards,
+    expected_yac,
+    yac_above_expectation,
+    impute_with = imp_vars(points, qb_pacr)
+  ) %>%
+  step_impute_linear(catch_percentage, yac,  impute_with = imp_vars(sr, points, qb_dakota)) %>%
+  # Targetted PLS
+  step_pls(
+    drive_points_oe,
+    drive_wpa,
+    outcome = 'outcome_sr',
+    prefix = 'd',
+    num_comp = 1
+  ) %>%
+  step_pls(
+    team_points_result,
+    team_wp,
+    outcome = 'outcome_sr',
+    prefix = 'p',
+    num_comp = 1
+  ) %>%
+  # Yeo Johnson
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  # Normalize
+  step_normalize(all_numeric_predictors()) %>%
+  # Dummy
+  step_dummy(all_nominal_predictors())
+
+```
+
+# Specify Models
+
+```{r}
+
+xgb <-
+  boost_tree(
+    min_n = tune(),
+    mtry = tune(),
+    tree_depth = tune(),
+    loss_reduction = tune(),
+    sample_size = tune(),
+    learn_rate = tune(),
+    trees = 2000
+  ) %>%
+  set_engine('xgboost') %>%
+  set_mode('regression')
+
+mlp <-
+  mlp(hidden_units = tune(),
+          epochs = tune(),
+          penalty = tune()) %>%
+  set_mode('regression')
+
+glmnet <- linear_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode('regression') %>%
+  set_engine('glmnet')
+
+```
+
+# Tune and Fit Workflows
+
+```{r}
+
+set <- workflow_set(
+  preproc = list(rec = rec),
+  models = list(xgb, mlp, glmnet),
+  cross = F
+)
+
+small_grid <- set %>%
+  filter(wflow_id == 'rec_linear_reg') %>%
+  workflow_map('tune_grid',
+               seed = 55,
+               resamples = data_folds,
+               control = control_grid(verbose = T),
+               grid = 15)
+
+big_grid <- set %>%
+  filter(wflow_id %in% c('rec_boost_tree', 'rec_mlp')) %>%
+  workflow_map(
+    'tune_race_anova',
+    seed = 44,
+    resamples = data_folds,
+    control = control_race(verbose = T),
+    grid = 50
+  )
+
+# Results
+
+res <- bind_rows(small_grid, big_grid)
+
+autoplot(res, metric = 'rmse')
+
+```
+
+# Pulling Results
+
+```{r}
+
+tidymodels_prefer()
+
+model_names <- res$wflow_id
+
+model_names %>%
+  map(
+    ~ extract_workflow(res, .x) %>%
+      finalize_workflow(
+        extract_workflow_set_result(res, id = .x) %>%
+          select_best('rmse')
+      )
+  ) %>%
+  map(last_fit, data_split) %>%
+  map(collect_metrics)
+
+model_names %>%
+  map(
+    ~ extract_workflow(res, .x) %>%
+      finalize_workflow(
+        extract_workflow_set_result(res, id = .x) %>%
+          select_best('rmse')
+      )
+  ) %>%
+  map(last_fit, data_split) %>%
+  map(extract_workflow) %>%
+  set_names(nm = model_names) %>%
+  iwalk( ~ saveRDS(.x, glue("{.y}.rds")))
+
+
+
+
+
+model_names %>%
+  map(
+    ~ extract_workflow(res, .x) %>%
+      finalize_workflow(
+        extract_workflow_set_result(res, id = .x) %>%
+          select_best('rmse')
+      )
+  ) %>%
+  map(last_fit, data_split) %>%
+  map(collect_metrics)
+
+model_names %>%
+  map(
+    ~ extract_workflow(res, .x) %>%
+      finalize_workflow(
+        extract_workflow_set_result(res, id = .x) %>%
+          select_best('rmse')
+      )
+  ) %>%
+  map(last_fit, data_split) %>%
+  map(extract_workflow) %>%
+  set_names(nm = model_names) %>%
+  iwalk( ~ saveRDS(.x, glue("{.y}.rds")))
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

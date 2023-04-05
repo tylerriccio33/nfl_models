@@ -1,0 +1,378 @@
+---
+title: "R Notebook"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Initialization
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(glue)
+library(rlang)
+library(furrr)
+library(desirability2)
+
+future::plan(multisession, workers = 4)
+
+```
+
+```{r}
+data <- read_csv('interacted.csv') %>%
+  filter(id_season != 2016) %>%
+  select(-c(starts_with('id_'))) %>%
+  mutate(era = as.factor(era)) %>%
+  # Removing era for now since it complicates things
+  select(-era) %>%
+  
+  drop_na()
+  
+```
+
+# Algorithm
+
+```{r}
+
+generate_genetic_solutions <- function(data,
+                                       n_bootstraps = 5,
+                                       init_pool_size = 10,
+                                       max_generations = 10,
+                                       carrying_capacity = NULL,
+                                       extinction_threshold = NULL,
+                                       growth_rate = .1,
+                                       mutation_p = .01) {
+  
+  # Check Population Control Methods
+  if (!is.null(carrying_capacity) & !is.null(extinction_threshold))
+    rlang::abort('Only one population control method can be used.')
+  if (!is.null(carrying_capacity) & is.null(extinction_threshold)) {
+    control_method <- 'carrying_capacity'
+  } else if (!is.null(extinction_threshold)) {
+    if(extinction_threshold %% 2 != 0)
+    rlang::abort('Extinction threshold must be even.')
+    control_method <- 'extinction_threshold'
+  } else {
+    control_method <- 'none'
+  }
+  
+  # Warnings and messages
+  if (init_pool_size %% 2 != 0)
+    rlang::abort('Initial pool must be even.')
+  
+  
+round_even <- function(x) {
+  if (x %% 2 == 0) {
+    # x is already even
+    return(as.integer(x))
+  } else if (x %% 1 == 0.5) {
+    # x is halfway between two integers, round to the nearest even integer
+    return(as.integer(x - 0.5) + (as.integer(x - 0.5) %% 2 == 0))
+  } else {
+    # x is odd, round up or down to the nearest even integer
+    return(as.integer(round(x, 0) + (round(x, 0) %% 2 == 1)))
+  }
+}
+
+  # Generate Offspring Helper
+  generate_offspring_helper <- function(data) {
+    
+    data %>%
+      group_by(id) %>%
+      select(-parent) %>%
+      # Convert raw odds
+      mutate(across(everything(), ~ if_else(.x == 1, .5 - mutation_p, mutation_p))) %>%
+      # Sum odds
+      summarize(across(everything(), ~ sum(.x)), .groups = 'keep') %>%
+      # Sample
+      mutate(across(everything(), ~ list(rbinom(
+        n = 4, size = 1, prob = .x
+      ))))  %>%
+      pivot_longer(cols = -id) %>%
+      unnest(value) %>%
+      group_by(id, name) %>%
+      mutate(child = row_number())  %>%
+      ungroup() %>%
+      filter(value == 1)  %>%
+      select(-value)  %>%
+      group_by(id, child) %>%
+      summarize(variables = list(name), .groups = 'drop')
+  }
+  
+  # Generate K-Folds
+  resamples <- rsample::vfold_cv(data, v = n_bootstraps) %>%
+    pull(splits) %>%
+    map(analysis)
+
+  # Build Gene Pool
+  # This also serves as the feature blueprint in various places
+  gene_pool <- select(data,-starts_with('outcome_')) %>%
+    # Slice to empty tibble
+    slice(0) %>%
+    mutate(across(everything(), ~ as.numeric(.x)))
+  
+  # Traverse Resamples
+  results_vector <-
+    vector(mode = 'list', length = length(n_bootstraps))
+  for (i in seq_along(n_bootstraps)) {
+    # Current Resamples
+    cur_resample <- resamples[[i]]
+    
+    # Fit single model with worst feature to find max residual
+    worst_feature <- cur_resample %>%
+      pivot_longer(-outcome_sr) %>%
+      group_by(name) %>%
+      summarize(c = cor(outcome_sr, value), .groups = 'drop') %>%
+      mutate(c = abs(c)) %>%
+      slice_min(c, n = 1) %>%
+      pull(name)
+    # Setting up model
+    max_residual <-
+      ranger::ranger(
+        formula = outcome_sr ~ .,
+        num.trees = 1,
+        mtry = 1,
+        data = select(cur_resample, outcome_sr, all_of(worst_feature))
+      )
+    max_residual <- sqrt(max_residual$prediction.error)
+        
+    # Create initial chromosomes
+    # Initializing with half of gene pool size
+    
+    chromos <- tibble(
+      present = sample(
+        c(0, 1),
+        size = (ncol(gene_pool) * init_pool_size),
+        prob = c(.5, .5),
+        replace = T
+      ),
+      gene = rep(x = colnames(gene_pool), times =  init_pool_size)
+    ) %>%
+      mutate(group = ((row_number() - 1) %/% ncol(gene_pool)) + 1) %>%
+      pivot_wider(names_from = gene, values_from = present) %>%
+      group_by(group) %>%
+      nest() %>%
+      pull(data)
+    
+    # Start Reproduction
+    cur_generation <- 1
+    children <- 5
+    generation_results <-
+      vector(mode = 'list',
+             length = length(max_generations))
+    
+    while (cur_generation <= max_generations) {
+      print(glue("Generation {cur_generation} Size: {length(chromos)}"))
+      
+      growth_rate <- growth_rate
+      
+      # Check extinction and a carrying capacity rules
+      if (control_method == 'extinction_threshold') {
+        # Check if extinction event needs to happen
+        if (length(chromos) >= extinction_threshold) {
+          chromos <-
+            chromos[-sample(length(chromos),
+                            size = round_even((length(chromos) * .5)),
+                            replace = F)]
+        } else if (control_method == 'carrying_capacity') {
+          if (length(chromos) >= carrying_capacity) {
+            # Set Growth Rate to 0
+            growth_rate <- 0
+            # Set the number of chromosomes to half of target carrying capacity
+            
+            return(chromos)
+            
+            chromos <-
+              chromos[-sample(length(chromos),
+                              size = round_even((length(chromos) * .5)),
+                              replace = F)]
+          }
+        }
+      }
+      
+    
+      n_pairs <- length(chromos) / 2
+      # Split into male and female
+      male <- sample(x = c(1:(n_pairs * 2)), size = n_pairs)
+      female <-
+        purrr::discard(c(1:length(chromos)), ~ .x  %in% male)
+      
+      # Build offspring
+      pairs <- future_map2(.x = male, .y = female, ~ {
+        male_chromosome <- chromos[[.x]]
+        female_chromosome <- chromos[[.y]]
+        # Parent == 1 ~ male
+        # Parent == 2 ~ female
+        bind_rows(male_chromosome, female_chromosome, .id = 'parent')
+      })
+      
+      chromos <- pairs %>%
+        list_rbind(names_to = 'id') %>%
+        generate_offspring_helper() %>%
+        # Create model data from variables
+        mutate(
+          model_data = map(variables,
+                           ~ cur_resample %>%
+                             select(starts_with('outcome_'), all_of(.x))),
+          # Fit models and extract fit
+          mean_residual = future_map_dbl(model_data, ~ {
+            fit_object <-
+              ranger::ranger(
+                outcome_sr ~ .,
+                num.trees = 4,
+                mtry = (ncol(.x) - 1)/4,
+                data = .x
+              )
+            return(sqrt(fit_object$prediction.error))
+          }, .options = furrr_options(seed = T))
+        )
+      
+      new_chromsomes <- (n_distinct(chromos$id) * 2) * (1+growth_rate)
+      new_chromsomes <- 2 * round(new_chromsomes/2)
+      
+      
+      # Edit this to change desirability terms
+      chromos <- chromos %>%
+        # Adding desirability terms
+        # This subtly increases biodiversity b/c 2 fits are optimized
+        mutate(
+          d_resid = desirability2::d_min(
+            mean_residual,
+            low = .04,
+            high = max_residual
+          ),
+          term_length = map_dbl(variables, length),
+          d_terms = desirability2::d_min(
+            term_length,
+            low = 20,
+            high = 30
+          ),
+          desirability = desirability2::d_overall(d_resid)
+        )  %>%
+        slice_min(order_by = mean_residual,
+                  with_ties = F,
+                  n = new_chromsomes)
+      
+      # Log generation results
+      generation_results[[cur_generation]] <- chromos %>%
+        select(variables, mean_residual, term_length)
+      
+      # Convert chromosomes to dummy tibble
+      # Each row is a chromosome
+      chromos <- chromos %>%
+        mutate(model_data = map(model_data, ~ slice(.x, 1))) %>%
+        select(model_data) %>%
+        unnest(model_data) %>%
+        bind_rows(gene_pool, .) %>%
+        mutate(across(everything(), ~ if_else(is.na(.x), 0 , 1)))
+      
+      # Calculate Convergence
+      convergence <- chromos %>%
+        as.matrix() %>%
+        Rfast::rowmeans() %>%
+        # Measure each gene's distance from .5
+        # .5 representing an variant prevalence of exactly half
+        # Scaling back to 0 to 1 basis with 1 being the most similar
+        map_dbl(~ abs(.5 - .x) / .5) %>%
+        mean() %>%
+        round(digits = 2)
+      
+
+      print(glue("Convergance at {convergence*100}%"))
+      generation_results[[cur_generation]] <-
+        generation_results[[cur_generation]] %>%
+        mutate(convergence = convergence)
+      if(convergence > .9) break
+      chromos <- chromos %>%
+        mutate(id = row_number()) %>%
+        nest(.by = id) %>%
+        pull(data)
+
+      # Add generation
+      cur_generation <- cur_generation + 1
+
+    }
+    
+    return(generation_results)
+    
+  }
+  
+}
+
+start <- Sys.time()
+data %>%
+  generate_genetic_solutions(
+    max_generations = 25,
+    growth_rate = .1,
+    carrying_capacity = 50,
+    init_pool_size = 48,
+    mutation_p = .02
+  )
+print(Sys.time() - start)
+
+set.seed(69)
+t <- data %>%
+  generate_genetic_solutions(
+    max_generations = 100,
+    growth_rate = 0,
+    carrying_capacity = 50,
+    init_pool_size = 20,
+    mutation_p = .02
+  )
+
+t
+
+t %>%
+  list_rbind(names_to = 'id') %>%
+  rename(generation = id) %>%
+  mutate(desirability = desirability2::d_overall(
+    d_min(mean_residual, min(mean_residual), max(mean_residual)),
+    d_min(term_length, min(term_length), max(term_length))
+  )) %>%
+  # Analysis
+  group_by(generation) %>%
+  summarize(gen_size = n(),
+            convergence = first(convergence),
+            avg_residual = mean(mean_residual),
+            avg_length = mean(term_length),
+            avg_desirability = mean(desirability)) %>%
+  ungroup() %>%
+  pivot_longer(-generation) %>%
+  mutate(generation = as.factor(generation)) %>%
+  # Plotting
+  ggplot(aes(generation, value, color = name)) +
+  geom_point() +
+  facet_wrap(~ name, scales = 'free_y') +
+  geom_smooth(method = "loess", se=TRUE, aes(group=1))+
+  # Theming
+  ggthemes::theme_fivethirtyeight()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

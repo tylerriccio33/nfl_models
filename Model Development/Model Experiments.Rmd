@@ -1,0 +1,1580 @@
+---
+title: "Models"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+
+library(tabulaR)
+library(rlang)
+library(tidyverse)
+library(finetune)
+library(ggrepel)
+library(tidymodels)
+library(rules)
+library(tidyposterior)
+library(baguette)
+library(broom)
+library(baguette)
+library(corrr)
+library(colino)
+library(doParallel)
+library(tidy.outliers)
+tidymodels_prefer()
+options(scipen = 999)
+
+data <- read_csv('interacted.csv') %>%
+  # Remember there is some wierd issue with the NFL API 
+  # The rows effected tend to have missing points
+  drop_na(starts_with('id_'), starts_with('outcome_'), points) %>%
+  # ERA sometimes isn't factorized
+  mutate(era = as.factor(era)) %>%
+  # Remove first year
+  filter(id_season > 2006)
+
+unregister <- function() {
+  env <- foreach:::.foreachGlobals
+  rm(list=ls(name=env), pos=env)
+}
+unregister()
+
+# Parallel
+all_cores <- parallel::detectCores(logical = FALSE)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+```
+
+# Sim Anneal Feature Sets
+
+```{r}
+processed_data <- data %>%
+  # Remove ID Features
+  select(-c(
+    game_id,
+    posteam,
+    defteam,
+    season,
+    week,
+    season,
+    spread_line,
+    moneyline,
+    elo
+  )) %>%
+  # Remove pointless features I don't feel like imputing
+  select(-c(
+    contains('percent_share_of_intended_air_yards'),
+    contains('intended_air_yards')
+  )) %>%
+  recipe(res ~ . , data = .) %>%
+  # Impute QB Cols from QB ELO
+  step_impute_linear(qb_pacr_1, qb_dakota_1, qb_cpoe_1, impute_with = imp_vars(qb_elo_1)) %>%
+  step_impute_linear(qb_pacr_2, qb_dakota_2, qb_cpoe_2, impute_with = imp_vars(qb_elo_2)) %>%
+  # Imputing Cushion with x_drive_yards_allowed and x_drive_yards
+  step_impute_linear(cushion,
+                     cushion_allowed,
+                     impute_with = imp_vars(x_drive_yards_allowed, x_drive_yards)) %>%
+  # Impute Separation
+  # Bag impute to include era
+  step_impute_bag(separation, impute_with = imp_vars(wepa, yards_gained_oe, qb_elo_1, era)) %>%
+  step_impute_bag(
+    separation_allowed,
+    impute_with = imp_vars(wepa_allowed, yards_gained_oe_allowed, qb_elo_2, era)
+  ) %>% 
+  # Impute Catch Percentage
+  step_impute_linear(catch_percentage,
+                     impute_with = imp_vars(wepa, adj_drive_points, qb_dakota_1)) %>%
+   step_impute_linear(catch_percentage_allowed,
+                     impute_with = imp_vars(wepa_allowed, adj_drive_points_allowed, qb_dakota_2)) %>%
+  # Impute YAC
+  step_impute_linear(yac, 
+                     impute_with = imp_vars(adj_drive_points, wepa, qb_pacr_1)) %>%
+  step_impute_linear(yac_allowed,
+                     impute_with = imp_vars(adj_drive_points_allowed, wepa_allowed, qb_pacr_2)) %>%
+  # Impute xYAC
+  step_impute_linear(expected_yac, impute_with = imp_vars(wepa, pythag_points, qb_pacr_1)) %>%
+  step_impute_linear(
+    expected_yac_allowed,
+    impute_with = imp_vars(wepa_allowed, pythag_points, qb_pacr_2)
+  ) %>%
+  # Impute yac_oe
+  # Bag impute to leverage era
+  step_impute_bag(yac_above_expectation, impute_with = imp_vars(yards_gained_oe, qb_elo_1, era)) %>%
+    step_impute_bag(yac_above_expectation_allowed, impute_with = imp_vars(yards_gained_oe_allowed, qb_elo_2, era)) %>%
+  # Targeted PLS
+  # General Offensive Capability
+  step_pls(
+    wepa,
+    drive_wpa,
+    adj_drive_points,
+    drive_points_oe,
+    yards_gained_oe,
+    prefix = 'drive1_',
+    num_comp = 1,
+    outcome = 'res'
+  ) %>%
+  step_pls(
+    wepa_allowed,
+    drive_wpa_allowed,
+    adj_drive_points_allowed,
+    drive_points_oe_allowed,
+    yards_gained_oe_allowed,
+    prefix = 'drive2_',
+    num_comp = 1,
+    outcome = 'res'
+  ) %>%
+  step_pls(
+    mean_wp,
+    hth_like_res,
+    res_rolled,
+    pythag_points,
+    pythag_epa,
+    prefix = 'team',
+    num_comp = 1,
+    outcome = 'res'
+  ) %>%
+  # Normalize
+  step_normalize(all_numeric_predictors()) %>%
+  # Dummy
+  step_dummy(all_nominal_predictors()) %>%
+  prep() %>%
+  juice() %>%
+  
+  # Experimental
+  
+  # Removing half of the secondaries on the feature pairs
+  # Example: keep qb_elo_1 but not qb_elo_2
+  # Assumption is same signal just reversed so variance is noise
+  
+  select(-matches('_2$'),-matches('_allowed$')) %>%
+  relocate(res)
+
+sim_anneal_features <-
+  function(data,
+           strict_inclusions,
+           init_subsets,
+           bootstraps = 10, # Number of times each set is resampled
+           init_prop = .25, # Number of features for initial set
+           k_size = 3) {
+
+  # Character strict inclusions
+  char_strict_inclusions <- data %>%
+    select({{strict_inclusions}}) %>%
+    colnames()
+  
+  subsettable_cols <- data %>%
+    select(-res, -c({{strict_inclusions}})) %>%
+    colnames()
+    
+  spec <- linear_reg(penalty = .95, mixture = .95) %>%
+    set_engine('glmnet') %>%
+    set_mode('regression')
+  base_mod <- workflow() %>%
+    add_model(spec) %>%
+    add_formula(res ~ .)
+  
+  final_buckets <- vector(mode = 'list', length = init_subsets)
+  
+  for(i in 1:init_subsets) {
+    
+    # Start with ~ 50%
+    cur_random_sample <-
+      sample(x = subsettable_cols, size = init_prop * length(subsettable_cols))
+    
+    init_data <- data %>% 
+      select(res, {{strict_inclusions}}, all_of(cur_random_sample))
+    
+    # Evaluate base model
+    
+    # 10 for testing but this should be hard coded and much higher
+    # This needs to be as stable as mathematically possible
+    resamples <- bootstraps(init_data, times = 10)
+    
+    init_rmse <- base_mod %>%
+      fit_resamples(resamples = resamples) %>%
+      collect_metrics() %>%
+      filter(.metric == 'rmse') %>%
+      pull(mean)
+    
+    cur_data <- init_data
+    safe_features <- c(char_strict_inclusions, 'res')
+    remove_features <- NULL
+    
+    bucket <- NULL
+    bucket_scores <- NULL
+    features_present <- NULL
+    resample_results <- NULL
+    temp_counter <- 1
+    
+    while(TRUE) {
+      # Sample current data remove candidates
+      remove_candidates <- cur_data %>%
+        select(-all_of(safe_features)) %>%
+        colnames()
+      # If no more remove candidates break
+      if(length(remove_candidates)==0) break
+      # Dynamic sample size selection
+      sample_size <-
+        if_else(length(remove_candidates) < k_size, length(remove_candidates), k_size)
+      cur_remove <- sample(remove_candidates, size = sample_size)
+      # Model data without current removed
+      temp_data <- init_data  %>%
+        select(-all_of(cur_remove))
+      cur_resamples <- bootstraps(temp_data, times = bootstraps)
+      
+      # Need to eventually keep track of subsets
+      # This way if a "good" feature is removed I can see what else was present
+      # This can give a way to imply mutual information
+      
+      # Evaluate Feature Set
+      # Keep resamples for posterior analysis
+      # Summarize RMSE from all resamples to guide selection process
+      
+      cur_fitted_resamples <-  base_mod %>%
+        fit_resamples(resamples = cur_resamples)
+      cur_rmse <- cur_fitted_resamples %>%
+        collect_metrics() %>%
+        filter(.metric == 'rmse') %>%
+        pull(mean)
+      cur_total_resample_metrics <- cur_fitted_resamples %>%
+        group_by(id) %>%
+        unnest(.metrics) %>%
+        filter(.metric == 'rmse') %>%
+        pull(.estimate)
+      
+      # Update bucket
+      bucket[[temp_counter]] <- cur_remove
+      # Score represents RMSE lost
+      # Positive scores mean features contributed
+      # Negative Scores mean features did not contribute
+      # Example: cur_rmse = 15 and init_rmse = 13
+      # This would indicate the features contributed to 2 RMSE points of the initial model
+      bucket_scores[temp_counter] <- cur_rmse - init_rmse
+      # Update features present
+      features_present[[temp_counter]] <- colnames(cur_data)
+      # Update List of resample results
+      resample_results[[temp_counter]] <- cur_total_resample_metrics
+      # If RMSE is worst, information is lost and features are safe
+      # If RMSE is better, information is not lost and features are removed
+      if(cur_rmse > init_rmse) {
+        # Append new safe features
+        # Don't modify the data
+        safe_features <- append(safe_features, cur_remove)
+      } else {
+        # Append new remove features
+        remove_features <- append(remove_features, cur_remove)
+        # Remove features from current data
+        cur_data <- cur_data %>%
+          select(-all_of(cur_remove))
+      }
+      
+      temp_counter <- temp_counter + 1
+
+    }
+    
+  # Organize bucket
+    
+    bucket <- enframe(bucket) %>%
+      select(bucket = value)
+    features_present <- enframe(features_present) %>%
+      select(features_present = value)
+    bucket_scores <- enframe(bucket_scores) %>%
+      select(assoc_score = value)
+    resample_results <- resample_results %>%
+      enframe() %>%
+      select(scores = value)
+    final_buckets[[i]] <-
+      bind_cols(bucket, features_present, bucket_scores, resample_results)
+    
+  print(glue("Finished: {i} / {init_subsets}"))
+    
+  }
+  
+
+  
+  final_buckets <- final_buckets %>%
+    # Reduce lists to rows in tibble
+    reduce(bind_rows) %>%
+    # Making features present a tibble of dummy variables
+    mutate(features_present = map(features_present, ~ {
+      out_tibble <- data.frame(matrix(ncol = length(.x), nrow = 1))
+      colnames(out_tibble) <- .x
+      out_tibble <- out_tibble %>%
+        mutate(across(everything(), ~ 1)) %>%
+        as_tibble()
+      return(out_tibble)
+    })) %>%
+    # Unnesting Scores since each score is a single fit
+    unnest(scores) %>%
+    mutate(fit = row_number()) %>%
+    # Pulling out features
+    group_by(fit) %>%
+    unnest(bucket) %>%
+    ungroup() %>%
+    rename(
+      feature_removed = bucket,
+      model_loss = assoc_score,
+      fit_id = fit,
+      rmse = scores
+    ) %>%
+      # Adding fit_id to the features_present tibble
+  mutate(features_present = map2(features_present, fit_id, ~ {
+    .x %>%
+      mutate(fit_id = .y)
+  }))
+  
+  # Full out features_present and join by fit_id
+  features_present_list <- final_buckets %>%
+    pull(features_present) %>%
+    reduce(bind_rows) %>%
+    relocate(fit_id) %>%
+    # Can remove res
+    select(-res) %>%
+    # Many duplicates
+    unique()
+  
+  # Join back to final_buckets
+  formatted_tibble <- final_buckets %>%
+    # Remove initial list col
+    select(-features_present) %>%
+    # Join to tibble grid of fits and features
+    left_join(features_present_list, by = 'fit_id', multiple = "all") %>%
+    # Convert NA to 0s
+    mutate(across(where(is.numeric), ~ if_else(is.na(.x), 0, .x)))
+
+    
+  return(formatted_tibble)
+
+}
+  
+set.seed(1)
+t <- processed_data %>%
+  sim_anneal_features(
+    strict_inclusions = c(
+      # Core Metrics
+      team1,
+      matches('^drive\\d'),
+      contains('qb_dakota'),
+      # Known non-interactions
+      matches('^site_'),
+      matches('^playoff_'),
+      matches('^div_game'),
+      matches('^era_'),
+      matches('n_coach_starts')
+    ),
+    init_prop = .25,
+    init_subsets = 50,
+    bootstraps = 4,
+    k_size = 2
+  )
+
+# Model fit from results
+
+model_data <- t %>%
+  select(-c(feature_removed, model_loss, fit_id)) %>%
+  unique()
+
+set.seed(1)
+data_folds <-
+  vfold_cv(model_data, 
+           v = 5, 
+           repeats = 5,
+           strata = rmse)
+
+mod <- bag_mars() %>%
+  set_mode('regression')
+
+set.seed(2)
+rec <- recipe(rmse ~ ., data = model_data) %>%
+  step_nzv(all_predictors()) %>%
+  step_lincomb(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+wf <- workflow() %>%
+  add_model(mod) %>%
+  add_recipe(rec)
+
+res <- fit_resamples(wf, resamples = data_folds)
+
+res %>%
+  collect_metrics()
+
+
+
+
+# Analysis
+
+cross_importance_analysis <- t %>%
+  select(-c(rmse, fit_id)) %>%
+  group_by(feature_removed) %>%
+  nest() %>%
+  ungroup() %>%
+  # Pivot Nested Data
+  mutate(data = map(data, ~ {
+    .x %>%
+      pivot_longer(cols = -model_loss) %>%
+      # Factorize Values as present
+      transmutate(present = value == 1) %>%
+      # Get Average Loss
+      group_by(name, present) %>%
+      summarize(
+        sd = sd(model_loss),
+        n = n(),
+        model_loss = mean(model_loss)
+      ) %>%   # Sort on name, present so that true is always first
+  # This way you know _1 is TRUE and _2 is FALSE
+  arrange(-present, .by_group = T) %>%
+  # Sort 
+  pivot_wider(names_from = present,
+              values_from = c(sd, n, model_loss)) %>%
+  rename_with( ~ str_replace_all(.x, '_TRUE$', '_1')) %>%
+  rename_with( ~ str_replace_all(.x, '_FALSE$', '_2')) %>%
+  # Remove where pair was never evaluated
+  drop_na() %>%
+  # Compute T Statistic
+  # Rowwise instead of pmap for readability
+  rowwise() %>%
+  mutate(
+    t_stat = (model_loss_1 - model_loss_2) / sqrt(sd_1 ^ 2 / n_1 + sd_2 ^ 2 /
+                                                    n_2),
+    p_val = 2 * pt(-abs(t_stat), (n_1 + n_2) - 2)
+  ) %>%
+  ungroup() %>%
+  # Filter P values
+  # Setting alpha to .05
+  filter(p_val < .05) %>%
+
+  # High T Stat means feature present increases importance of feature removed
+  # High T Stat directly means higher model loss on removal
+      
+  # Low T stat means feature present decreases importance of feature removed
+  # Low T stat directly means lower model loss on removal
+      
+  select(feature_present = name, t_stat)
+  })) %>%
+  unnest(data)
+
+cross_importance_analysis
+
+cross_importance_analysis %>%
+  arrange(-abs(t_stat)) %>%
+  slice_head(n = 25) %>%
+  ggplot(aes(feature_present, t_stat, fill = feature_removed)) +
+  geom_col() +
+  facet_wrap( ~ feature_removed, scales = 'free_x') +
+  ggthemes::theme_fivethirtyeight() +
+  labs(title = 'Model Loss by Feature Interaction',
+       subtitle = 'Lower T-Statistic indicates model compensated loss by use of alternative.')
+
+
+individual_analysis <- t %>%
+  group_by(feature_removed) %>%
+  summarize(
+    avg_improvement = mean(model_loss),
+    sd = sd(model_loss),
+    n_removed = n()
+  ) %>%
+  ungroup() %>%
+  mutate(
+    t_stat = pmap_dbl(list(avg_improvement, sd, n_removed),
+                      ~ (..1-0) / (..2 / sqrt(..3))))
+
+individual_analysis %>%
+  select(feature_removed, t_stat)
+
+individual_analysis %>%
+  mutate(feature_removed = as.factor(feature_removed),
+         feature_removed = fct_reorder(feature_removed, t_stat)) %>%
+  ggplot(aes(feature_removed, t_stat)) +
+  geom_col() +
+  coord_flip() +
+  ggthemes::theme_fivethirtyeight() +
+  labs(title = 'Isolated Feature Impacts',
+       subtitle = 'Higher values indicate model improvement.')
+
+
+select_relevant_features <- function(data) {
+  
+  # Pair sister features into expressions
+  cols <- colnames(select(data, - res))
+  capture_expressions <- vector(mode = 'character', length = length(cols))
+  for(i in 1:length(cols)) {
+    if (str_detect(cols[i], '_\\d$')) {
+      # Build expression
+      base_col <- str_replace(cols[i], '_\\d$', '')
+      capture_expressions[i] <- glue("{base_col}_\\d$")
+    } else if (str_detect(cols[i], '_allowed$')) {
+      # Build expression
+      base_col <- str_replace(cols[i], '_allowed$', '')
+      capture_expressions[i] <-
+        glue("{base_col}")
+    } else if (str_detect(cols[i], '_X\\d$')) {
+      # Build expression
+      base_col <- str_replace(cols[i], '_X\\d$', '')
+      capture_expressions[i] <- glue("{base_col}_X\\d$")
+    } else {
+      capture_expressions[i] <- glue("{cols[i]}")
+    }
+    
+  }
+  
+  capture_expressions <- capture_expressions %>%
+    unique()
+
+  # Model specification
+  spec <- linear_reg(penalty = .1, mixture = .95) %>%
+    set_engine('glmnet') %>%
+    set_mode('regression')
+  base_mod <- workflow() %>%
+    add_model(spec) %>%
+    add_formula(res ~ .)
+  
+  # Baseline
+  resamples <- bootstraps(data, times = 10)
+  base_rmse <- base_mod %>%
+    fit_resamples(resamples = resamples) %>%
+    collect_metrics() %>%
+    filter(.metric == 'rmse') %>%
+    pull(mean)
+  
+  safe_features <- NULL
+  
+  for(i in 1:length(capture_expressions)) {
+    
+    cur_expr <- capture_expressions[i]
+    
+    cur_resamples  <- data %>%
+      select(-matches(cur_expr)) %>%
+      bootstraps(times = 5, data = .)
+    
+      cur_rmse <- base_mod %>%
+        fit_resamples(resamples = cur_resamples) %>%
+        collect_metrics() %>%
+        filter(.metric == 'rmse') %>%
+        pull(mean)
+    
+      if(cur_rmse > base_rmse) safe_features <- append(safe_features, cur_expr)
+      
+      print(glue("Done: {i} / {length(capture_expressions)}"))
+    
+  }
+  
+  return(safe_features)
+  
+}
+
+processed_data %>%
+  select_relevant_features()
+
+# New method to locate features with usable information:
+# Evaluate all features to find global safe
+# Then evaluate pair combinations to find features augmented by another
+
+```
+
+# Randomly Sampling Predictors
+
+```{r}
+
+processed_data <- data %>%
+  # Remove ID Features
+  select(-c(
+    game_id,
+    posteam,
+    defteam,
+    season,
+    week,
+    season,
+    spread_line,
+    moneyline,
+    elo
+  )) %>%
+  # Remove pointless features I don't feel like imputing
+  select(-c(
+    contains('percent_share_of_intended_air_yards'),
+    contains('intended_air_yards')
+  )) %>%
+  recipe(res ~ . , data = .) %>%
+  # Impute QB Cols from QB ELO
+  step_impute_linear(qb_pacr_1, qb_dakota_1, qb_cpoe_1, impute_with = imp_vars(qb_elo_1)) %>%
+  step_impute_linear(qb_pacr_2, qb_dakota_2, qb_cpoe_2, impute_with = imp_vars(qb_elo_2)) %>%
+  # Imputing Cushion with x_drive_yards_allowed and x_drive_yards
+  step_impute_linear(cushion,
+                     cushion_allowed,
+                     impute_with = imp_vars(x_drive_yards_allowed, x_drive_yards)) %>%
+  # Impute Separation
+  # Bag impute to include era
+  step_impute_bag(separation, impute_with = imp_vars(wepa, yards_gained_oe, qb_elo_1, era)) %>%
+  step_impute_bag(
+    separation_allowed,
+    impute_with = imp_vars(wepa_allowed, yards_gained_oe_allowed, qb_elo_2, era)
+  ) %>% 
+  # Impute Catch Percentage
+  step_impute_linear(catch_percentage,
+                     impute_with = imp_vars(wepa, adj_drive_points, qb_dakota_1)) %>%
+   step_impute_linear(catch_percentage_allowed,
+                     impute_with = imp_vars(wepa_allowed, adj_drive_points_allowed, qb_dakota_2)) %>%
+  # Impute YAC
+  step_impute_linear(yac, 
+                     impute_with = imp_vars(adj_drive_points, wepa, qb_pacr_1)) %>%
+  step_impute_linear(yac_allowed,
+                     impute_with = imp_vars(adj_drive_points_allowed, wepa_allowed, qb_pacr_2)) %>%
+  # Impute xYAC
+  step_impute_linear(expected_yac, impute_with = imp_vars(wepa, pythag_points, qb_pacr_1)) %>%
+  step_impute_linear(
+    expected_yac_allowed,
+    impute_with = imp_vars(wepa_allowed, pythag_points, qb_pacr_2)
+  ) %>%
+  # Impute yac_oe
+  # Bag impute to leverage era
+  step_impute_bag(yac_above_expectation, impute_with = imp_vars(yards_gained_oe, qb_elo_1, era)) %>%
+    step_impute_bag(yac_above_expectation_allowed, impute_with = imp_vars(yards_gained_oe_allowed, qb_elo_2, era)) %>%
+  # Targeted PLS
+  # General Offensive Capability
+  step_pls(
+    wepa,
+    drive_wpa,
+    adj_drive_points,
+    drive_points_oe,
+    yards_gained_oe,
+    prefix = 'drive1_',
+    num_comp = 1,
+    outcome = 'res'
+  ) %>%
+  step_pls(
+    wepa_allowed,
+    drive_wpa_allowed,
+    adj_drive_points_allowed,
+    drive_points_oe_allowed,
+    yards_gained_oe_allowed,
+    prefix = 'drive2_',
+    num_comp = 1,
+    outcome = 'res'
+  ) %>%
+  step_pls(
+    mean_wp,
+    hth_like_res,
+    res_rolled,
+    pythag_points,
+    pythag_epa,
+    prefix = 'team',
+    num_comp = 1,
+    outcome = 'res'
+  ) %>%
+  # Normalize
+  step_normalize(all_numeric_predictors()) %>%
+  # Dummy
+  step_dummy(all_nominal_predictors()) %>%
+  prep() %>%
+  juice() %>%
+  
+  # Experimental
+  
+  # Removing half of the secondaries on the feature pairs
+  # Example: keep qb_elo_1 but not qb_elo_2
+  # Assumption is same signal just reversed so variance is noise
+  
+  select(-matches('_2$'),-matches('_allowed$')) %>%
+  relocate(res)
+
+# Train Initial SVM Poly to Get Parameter Estimates
+
+set.seed(24)
+initial_folds <- vfold_cv(processed_data, v = 10, strata = res)
+
+initial_rec <- recipe(res ~ ., data = processed_data) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+initial_mod <-
+  svm_poly(
+    cost = tune(),
+    degree = tune(),
+    scale_factor = tune(),
+    margin = tune()
+  ) %>%
+  set_mode('regression')
+
+initial_wf <- workflow() %>%
+  add_model(inital_mod) %>%
+  add_recipe(initial_rec)
+
+set.seed(83)
+initial_res <- tune_race_anova(initial_wf, 
+                               resamples = initial_folds,
+                               control = control_race(verbose = T))
+
+initial_res %>%
+  collect_metrics()
+
+initial_res %>%
+  select_best('rmse')
+beepr::beep(1)
+
+# Cost = 13.1
+# Degree = 1
+# Scale Factor = .0035
+# Margin = 1.44
+
+fit_mod <- workflow() %>%
+  add_model(
+    spec = svm_poly(
+      cost = 13.1,
+      degree = 1,
+      scale_factor = .0035,
+      margin = 1.44
+    ) %>%
+      set_mode('regression')
+  ) %>%
+  add_formula(res ~ .)
+
+resample_features <-
+  function(data,
+           strict_inclusions,
+           base_mod = workflow() %>%
+             add_model(linear_reg()) %>%
+             add_formula(res ~ .),
+           init_subsets,
+           summarize = T,
+           bootstraps = 10, # Number of times each set is resampled
+           init_prop = .25) {
+  
+  subsettable_cols <- data %>%
+    select(-res, -c({{strict_inclusions}})) %>%
+    colnames()
+  
+  # Resample
+  resample_results <-
+    vector(mode = 'list', length = init_subsets)
+  features_used <-
+    vector(mode = 'list', length = init_subsets)
+
+  for(i in 1:length(resample_results)) {
+    
+    # Choose feature subset
+    random_inclusions <-
+      sample(x = subsettable_cols, size = init_prop * length(subsettable_cols))
+    
+cur_data <- data %>%
+  select(res, {{strict_inclusions}}, all_of(random_inclusions))
+# Resamples
+cur_resamples <-
+  vfold_cv(data = cur_data, v = bootstraps, strata = res)
+# Fit Resamples
+cur_fits <- fit_resamples(base_mod, resamples = cur_resamples)
+# Extract each fit's result
+resample_results[[i]] <- cur_fits %>%
+  group_by(id) %>%
+  unnest(.metrics) %>%
+  filter(.metric == 'rmse') %>%
+  pull(.estimate)
+# Log features used
+features_used[[i]] <- random_inclusions
+
+print(glue("Progress: {i} / {init_subsets}"))
+
+  }
+  
+  resample_results <- enframe(resample_results) %>%
+    select(results = value) %>%
+    mutate(model_id = row_number()) %>%
+    group_by(model_id) %>%
+    unnest(results) %>%
+    ungroup() 
+  
+  # Summarize if applicable
+  
+  if(summarize) {
+    resample_results <- resample_results %>%
+      group_by(model_id) %>%
+      summarize(results = mean(results)) %>%
+      ungroup()
+  }
+    
+  features_used <- enframe(features_used) %>%
+    select(features = value) %>%
+    mutate(features = map(features, ~ {
+      out_tibble <- data.frame(matrix(ncol = length(.x), nrow = 1))
+      colnames(out_tibble) <- .x
+      out_tibble <- out_tibble %>%
+        mutate(across(everything(), ~ 1)) %>%
+        as_tibble()
+      return(out_tibble)
+    })) %>%
+    mutate(model_id = row_number()) %>%
+    group_by(model_id) %>%
+    unnest(features) %>%
+    ungroup()
+  
+  # Joined results
+  resample_results %>%
+    left_join(features_used, by = 'model_id') %>%
+    relocate(model_id)
+
+}
+  
+set.seed(36)
+t <- processed_data %>%
+  resample_features(
+    summarize = T,
+    strict_inclusions = c(
+      # Core Metrics
+      team1,
+      matches('^drive\\d'),
+      contains('qb_dakota'),
+      # Known non-interactions
+      matches('^site_'),
+      matches('^playoff_'),
+      matches('^div_game'),
+      matches('^era_'),
+      matches('n_coach_starts')
+    ),
+    init_prop = .5,
+    init_subsets = 2000,
+    bootstraps = 5
+  )
+
+t
+
+# Model fit from results
+
+
+model_data <- t %>%
+  select(-model_id) %>%
+  mutate(across(where(is.numeric), ~ if_else(is.na(.), 0, .x)))
+
+set.seed(1)
+data_folds <-
+  vfold_cv(model_data,
+           v = 10,
+           repeats = 5,
+           strata = results)
+
+mod <-
+  boost_tree(
+    min_n = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune(),
+    sample_size = tune(),
+    mtry = tune(),
+    tree_depth = tune(),
+    trees = 1000
+  ) %>%
+  set_mode("regression")
+
+set.seed(2)
+rec <- recipe(results ~ ., data = model_data) %>%
+  step_nzv(all_predictors()) %>%
+  step_lincomb(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+wf <- workflow() %>%
+  add_model(mod) %>%
+  add_recipe(rec)
+
+set.seed(24)
+res <- tune_race_anova(wf,
+                       grid = 25,
+                       control = control_race(verbose = T),
+                       resamples = data_folds)
+
+res %>%
+  show_best('rmse')
+
+show_best(res, 'rmse')
+
+preds <- finalize_workflow(wf, select_best(res, 'rmse')) %>%
+  fit(model_data) %>%
+  predict(model_data) %>%
+  bind_cols(model_data) %>%
+  mutate(resid = results - .pred) %>%
+  relocate(results, resid)
+
+preds %>%
+ggplot(aes(results, .pred)) +
+  geom_point(alpha = 1/2) +
+  geom_smooth() +
+  ggthemes::theme_fivethirtyeight() +
+  labs(title = 'Predicted Over Real')
+
+# Analysis
+
+cross_importance_analysis <- t %>%
+  select(-c(rmse, fit_id)) %>%
+  group_by(feature_removed) %>%
+  nest() %>%
+  ungroup() %>%
+  # Pivot Nested Data
+  mutate(data = map(data, ~ {
+    .x %>%
+      pivot_longer(cols = -model_loss) %>%
+      # Factorize Values as present
+      transmutate(present = value == 1) %>%
+      # Get Average Loss
+      group_by(name, present) %>%
+      summarize(
+        sd = sd(model_loss),
+        n = n(),
+        model_loss = mean(model_loss)
+      ) %>%   # Sort on name, present so that true is always first
+  # This way you know _1 is TRUE and _2 is FALSE
+  arrange(-present, .by_group = T) %>%
+  # Sort 
+  pivot_wider(names_from = present,
+              values_from = c(sd, n, model_loss)) %>%
+  rename_with( ~ str_replace_all(.x, '_TRUE$', '_1')) %>%
+  rename_with( ~ str_replace_all(.x, '_FALSE$', '_2')) %>%
+  # Remove where pair was never evaluated
+  drop_na() %>%
+  # Compute T Statistic
+  # Rowwise instead of pmap for readability
+  rowwise() %>%
+  mutate(
+    t_stat = (model_loss_1 - model_loss_2) / sqrt(sd_1 ^ 2 / n_1 + sd_2 ^ 2 /
+                                                    n_2),
+    p_val = 2 * pt(-abs(t_stat), (n_1 + n_2) - 2)
+  ) %>%
+  ungroup() %>%
+  # Filter P values
+  # Setting alpha to .05
+  filter(p_val < .05) %>%
+
+  # High T Stat means feature present increases importance of feature removed
+  # High T Stat directly means higher model loss on removal
+      
+  # Low T stat means feature present decreases importance of feature removed
+  # Low T stat directly means lower model loss on removal
+      
+  select(feature_present = name, t_stat)
+  })) %>%
+  unnest(data)
+
+cross_importance_analysis
+
+cross_importance_analysis %>%
+  arrange(-abs(t_stat)) %>%
+  slice_head(n = 25) %>%
+  ggplot(aes(feature_present, t_stat, fill = feature_removed)) +
+  geom_col() +
+  facet_wrap( ~ feature_removed, scales = 'free_x') +
+  ggthemes::theme_fivethirtyeight() +
+  labs(title = 'Model Loss by Feature Interaction',
+       subtitle = 'Lower T-Statistic indicates model compensated loss by use of alternative.')
+
+
+individual_analysis <- t %>%
+  group_by(feature_removed) %>%
+  summarize(
+    avg_improvement = mean(model_loss),
+    sd = sd(model_loss),
+    n_removed = n()
+  ) %>%
+  ungroup() %>%
+  mutate(
+    t_stat = pmap_dbl(list(avg_improvement, sd, n_removed),
+                      ~ (..1-0) / (..2 / sqrt(..3))))
+
+individual_analysis %>%
+  select(feature_removed, t_stat)
+
+individual_analysis %>%
+  mutate(feature_removed = as.factor(feature_removed),
+         feature_removed = fct_reorder(feature_removed, t_stat)) %>%
+  ggplot(aes(feature_removed, t_stat)) +
+  geom_col() +
+  coord_flip() +
+  ggthemes::theme_fivethirtyeight() +
+  labs(title = 'Isolated Feature Impacts',
+       subtitle = 'Higher values indicate model improvement.')
+
+
+select_relevant_features <- function(data) {
+  
+  # Pair sister features into expressions
+  cols <- colnames(select(data, - res))
+  capture_expressions <- vector(mode = 'character', length = length(cols))
+  for(i in 1:length(cols)) {
+    if (str_detect(cols[i], '_\\d$')) {
+      # Build expression
+      base_col <- str_replace(cols[i], '_\\d$', '')
+      capture_expressions[i] <- glue("{base_col}_\\d$")
+    } else if (str_detect(cols[i], '_allowed$')) {
+      # Build expression
+      base_col <- str_replace(cols[i], '_allowed$', '')
+      capture_expressions[i] <-
+        glue("{base_col}")
+    } else if (str_detect(cols[i], '_X\\d$')) {
+      # Build expression
+      base_col <- str_replace(cols[i], '_X\\d$', '')
+      capture_expressions[i] <- glue("{base_col}_X\\d$")
+    } else {
+      capture_expressions[i] <- glue("{cols[i]}")
+    }
+    
+  }
+  
+  capture_expressions <- capture_expressions %>%
+    unique()
+
+  # Model specification
+  spec <- linear_reg(penalty = .1, mixture = .95) %>%
+    set_engine('glmnet') %>%
+    set_mode('regression')
+  base_mod <- workflow() %>%
+    add_model(spec) %>%
+    add_formula(res ~ .)
+  
+  # Baseline
+  resamples <- bootstraps(data, times = 10)
+  base_rmse <- base_mod %>%
+    fit_resamples(resamples = resamples) %>%
+    collect_metrics() %>%
+    filter(.metric == 'rmse') %>%
+    pull(mean)
+  
+  safe_features <- NULL
+  
+  for(i in 1:length(capture_expressions)) {
+    
+    cur_expr <- capture_expressions[i]
+    
+    cur_resamples  <- data %>%
+      select(-matches(cur_expr)) %>%
+      bootstraps(times = 5, data = .)
+    
+      cur_rmse <- base_mod %>%
+        fit_resamples(resamples = cur_resamples) %>%
+        collect_metrics() %>%
+        filter(.metric == 'rmse') %>%
+        pull(mean)
+    
+      if(cur_rmse > base_rmse) safe_features <- append(safe_features, cur_expr)
+      
+      print(glue("Done: {i} / {length(capture_expressions)}"))
+    
+  }
+  
+  return(safe_features)
+  
+}
+
+processed_data %>%
+  select_relevant_features()
+
+# New method to locate features with usable information:
+# Evaluate all features to find global safe
+# Then evaluate pair combinations to find features augmented by another
+
+
+
+
+```
+
+
+
+# Averaging Feature Importance 
+
+```{r}
+
+processed_data <- data %>%
+  # Remove ID Features
+  select(-c(
+    game_id,
+    posteam,
+    defteam,
+    season,
+    week,
+    season,
+    spread_line,
+    moneyline,
+    elo
+  )) %>%
+  # Remove pointless features I don't feel like imputing
+  select(-c(
+    contains('percent_share_of_intended_air_yards'),
+    contains('intended_air_yards')
+  )) %>%
+  recipe(res ~ . , data = .) %>%
+  # Impute QB Cols from QB ELO
+  step_impute_linear(qb_pacr_1, qb_dakota_1, qb_cpoe_1, impute_with = imp_vars(qb_elo_1)) %>%
+  step_impute_linear(qb_pacr_2, qb_dakota_2, qb_cpoe_2, impute_with = imp_vars(qb_elo_2)) %>%
+  # Imputing Cushion with x_drive_yards_allowed and x_drive_yards
+  step_impute_linear(cushion,
+                     cushion_allowed,
+                     impute_with = imp_vars(x_drive_yards_allowed, x_drive_yards)) %>%
+  # Impute Separation
+  # Bag impute to include era
+  step_impute_bag(separation, impute_with = imp_vars(wepa, yards_gained_oe, qb_elo_1, era)) %>%
+  step_impute_bag(
+    separation_allowed,
+    impute_with = imp_vars(wepa_allowed, yards_gained_oe_allowed, qb_elo_2, era)
+  ) %>% 
+  # Impute Catch Percentage
+  step_impute_linear(catch_percentage,
+                     impute_with = imp_vars(wepa, adj_drive_points, qb_dakota_1)) %>%
+   step_impute_linear(catch_percentage_allowed,
+                     impute_with = imp_vars(wepa_allowed, adj_drive_points_allowed, qb_dakota_2)) %>%
+  # Impute YAC
+  step_impute_linear(yac, 
+                     impute_with = imp_vars(adj_drive_points, wepa, qb_pacr_1)) %>%
+  step_impute_linear(yac_allowed,
+                     impute_with = imp_vars(adj_drive_points_allowed, wepa_allowed, qb_pacr_2)) %>%
+  # Impute xYAC
+  step_impute_linear(expected_yac, impute_with = imp_vars(wepa, pythag_points, qb_pacr_1)) %>%
+  step_impute_linear(
+    expected_yac_allowed,
+    impute_with = imp_vars(wepa_allowed, pythag_points, qb_pacr_2)
+  ) %>%
+  # Impute yac_oe
+  # Bag impute to leverage era
+  step_impute_bag(yac_above_expectation, impute_with = imp_vars(yards_gained_oe, qb_elo_1, era)) %>%
+    step_impute_bag(yac_above_expectation_allowed, impute_with = imp_vars(yards_gained_oe_allowed, qb_elo_2, era)) %>%
+  # Targeted PLS
+  # General Offensive Capability
+  step_pls(
+    wepa,
+    drive_wpa,
+    adj_drive_points,
+    drive_points_oe,
+    yards_gained_oe,
+    prefix = 'drive1_',
+    num_comp = 1,
+    outcome = 'res'
+  ) %>%
+  step_pls(
+    wepa_allowed,
+    drive_wpa_allowed,
+    adj_drive_points_allowed,
+    drive_points_oe_allowed,
+    yards_gained_oe_allowed,
+    prefix = 'drive2_',
+    num_comp = 1,
+    outcome = 'res'
+  ) %>%
+  step_pls(
+    mean_wp,
+    hth_like_res,
+    res_rolled,
+    pythag_points,
+    pythag_epa,
+    prefix = 'team',
+    num_comp = 1,
+    outcome = 'res'
+  ) %>%
+  # Normalize
+  step_normalize(all_numeric_predictors()) %>%
+  # Dummy
+  step_dummy(all_nominal_predictors()) %>%
+  prep() %>%
+  juice()
+
+calculate_agnostic_vi <- function(data, v = 10) {
+
+  results <- vector(mode = 'list', length = v)
+  for(i in 1:v) {
+    
+    # Sample DF
+    temp_data <- slice_sample(data, prop = .75)
+    
+    # Fit GLM
+    temp_glm <- linear_reg(penalty = .1, mixture = .95) %>%
+      set_engine('glmnet') %>%
+      fit(res ~ ., data = temp_data) %>%
+      extract_fit_engine() %>%
+      tidy() %>%
+      filter(term != '(Intercept)') %>%
+      mutate(across(c(estimate, lambda), ~ scales::rescale(.x)),
+             net_vi = abs(estimate * lambda)) %>%
+      group_by(term) %>%
+      summarize(net_vi = mean(net_vi)) %>%
+      ungroup() %>%
+      transmutate(importance = scales::rescale(net_vi))
+    
+  temp_rf <- rand_forest(trees = 1000) %>%
+    set_engine("ranger", num.threads = 4L, importance = "impurity") %>%
+    set_mode('regression') %>%
+    fit(res ~ ., data = temp_data) %>%
+    extract_fit_engine() %>%
+    vip::vi() %>%
+    rename(term = Variable,
+           importance = Importance) %>%
+    mutate(importance = scales::rescale(importance))
+  
+  results[[i]] <- bind_rows(temp_glm, temp_rf) %>%
+    # Coalescing Terms
+    # Need to explicitly handle nominal predictors first
+    mutate(
+      term = case_when(
+        str_detect(term, 'era_X') ~ 'era',
+        str_detect(term, 'site_') ~ 'site',
+        str_detect(term, 'div_game') ~ 'div_game',
+        str_detect(term, 'playoff_') ~ 'playoff',
+        TRUE ~ term
+      ),
+      # Handle _1 and _2
+      term = str_replace_all(term, '_\\d$', ''),
+      # Handle Allowed
+      term = str_replace_all(term, '_allowed$', '')
+    ) %>%
+    # Average Importance for this iteration
+    # Assumption of equally weighted models
+    group_by(term) %>%
+    summarize(importance = mean(importance)) %>%
+    ungroup()
+  
+  }
+  
+  results <- results %>%
+    reduce(bind_rows)
+  
+  return(results)
+
+}
+
+t <- processed_data %>%
+  calculate_agnostic_vi(v = 10) %>%
+  group_by(term) %>%
+  summarize(importance = mean(importance)) %>%
+  ungroup()
+
+t
+
+t %>%
+  mutate(term = fct_reorder(term, importance)) %>%
+  ggplot(aes(term, importance)) +
+  geom_col() +
+  coord_flip() +
+  ggthemes::theme_fivethirtyeight()
+
+```
+
+# Fitting All Models
+
+```{r}
+
+# Splits
+set.seed(1)
+data_split <- initial_split(data, strata = starts_with('outcome_'))
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+# Folds
+set.seed(2)
+data_folds <- vfold_cv(data_train, strata = starts_with('outcome_'), v = 10)
+
+data_train %>%
+  select(-starts_with('id_')) %>%
+  correlate() %>%
+    relocate(
+    term,
+    cushion,
+    separation,
+    intended_air_yards,
+    percent_share_of_intended_air_yards,
+    catch_percentage,
+    yac,
+    expected_yac,
+    yac_above_expectation
+  ) %>%
+  view()
+
+data_train %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything()) %>%
+  filter(value != 0)
+
+# Recipes
+rec <- recipe(outcome_sr ~ ., data = data_train) %>%
+  update_role(starts_with('id_'),
+              new_role = 'id') %>%
+  # Impute QB Stats first
+  step_impute_bag(qb_pacr, qb_dakota, qb_cpoe, impute_with = imp_vars(qb_elo, qb_starts)) %>%
+  # Impute WR Stats next
+  step_impute_linear(
+    cushion,
+    separation,
+    percent_share_of_intended_air_yards,
+    impute_with = imp_vars(sr, pass_wepa)
+  ) %>%
+  step_impute_linear(
+    intended_air_yards,
+    expected_yac,
+    yac_above_expectation,
+    impute_with = imp_vars(points, qb_pacr)
+  ) %>%
+  step_impute_linear(catch_percentage, yac,  impute_with = imp_vars(sr, points, qb_dakota)) %>%
+  # Targetted PLS
+  step_pls(
+    drive_points_oe,
+    drive_wpa,
+    outcome = 'outcome_sr',
+    prefix = 'd',
+    num_comp = 1
+  ) %>%
+  step_pls(
+    team_points_result,
+    team_wp,
+    outcome = 'outcome_sr',
+    prefix = 'p',
+    num_comp = 1
+  ) %>%
+  # Yeo Johnson
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  # Normalize
+  step_normalize(all_numeric_predictors()) %>%
+  # Dummy
+  step_dummy(all_nominal_predictors())
+
+rec  %>%
+  prep() %>%
+  juice() %>%
+  check_na()
+
+# Linear
+glm <- linear_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine('glmnet') %>%
+  set_mode('regression')
+# Hybrid
+svm_linear <- svm_linear(margin = tune(), cost = tune(),) %>%
+  set_mode('regression')
+svm_poly = svm_poly(
+  cost = tune(),
+  degree = tune(),
+  scale_factor = tune(),
+  margin = tune()
+) %>%
+  set_mode('regression')
+mlp <-
+  mlp(hidden_units = tune(),
+      penalty = tune(),
+      epochs = tune()) %>%
+  set_mode('regression')
+# Trees
+rf <- rand_forest(mtry = tune(),
+                  trees = 2000,
+                  min_n = tune()) %>%
+  set_mode('regression')
+xgb <-
+  boost_tree(
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune(),
+    sample_size = tune(),
+    stop_iter = tune(),
+    mtry = tune(),
+    trees = 2000
+  ) %>%
+  set_engine('xgboost') %>%
+  set_mode('regression')
+# Non parametric
+mars <- bag_mars(num_terms = tune(), 
+                 prod_degree = tune()) %>%
+  set_mode('regression')
+cubist <-
+  cubist_rules(
+    committees = tune(),
+    neighbors = tune(),
+    max_rules = tune()
+  ) %>%
+  set_mode('regression')
+bart <- bart(prior_terminal_node_coef = tune()) %>%
+  set_mode('regression')
+
+# Set
+set <-
+  workflow_set(
+    preproc = list(rec = rec),
+    models = list(glm, svm_linear,mlp, rf, xgb, mars, cubist, bart)
+  )
+
+# Fit
+resample_fits <- set %>%
+  workflow_map(
+    'tune_race_anova',
+    seed = 3,
+    grid = 10,
+    resamples = data_folds,
+    control = control_race(save_pred = T, verbose = T)
+  ) %>%
+  mutate(wflow_id = str_replace_all(wflow_id,'^rec_',''))
+
+# Plot Results
+autoplot(resample_fits,
+         select_best = T,
+         metric = "rmse") +
+  geom_text_repel(aes(label = wflow_id),
+                  nudge_x = .2,
+                  nudge_y = .001) +
+  theme(legend.position = "none")
+
+resample_fits %>%
+  filter(!wflow_id %in% c('rand_forest', 'boost_tree')) %>%
+  collect_metrics(summarize = FALSE) %>%
+  filter(.metric == "rmse") %>%
+  mutate(wflow_id = reorder(wflow_id, .estimate)) %>%
+  ggplot(aes(
+    x = wflow_id,
+    y = .estimate,
+    group = id,
+    color = id
+  )) +
+  geom_line(alpha = .5, lwd = 1.25) +
+  theme(legend.position = "none")
+
+resample_fits %>%
+  filter(!wflow_id %in% c('rand_forest', 'boost_tree')) %>%
+  collect_metrics(summarize = F) %>%
+  filter(.metric == 'rmse') %>%
+  mutate(wflow_id = fct_reorder(wflow_id, .estimate)) %>%
+  ggplot(aes(wflow_id, .estimate, color = wflow_id)) +
+  geom_boxplot() +
+  ggthemes::theme_fivethirtyeight()
+  
+  group_by(model) %>%
+  summarize(rmse = mean(.estimate)) %>%
+  ungroup() %>%
+  arrange(rmse)
+
+
+final_model <- resample_fits %>%
+  extract_workflow('linear_reg') %>%
+  finalize_workflow(extract_workflow_set_result(resample_fits, 'linear_reg') %>%
+                      select_best(metric ='rmse')) %>%
+  last_fit(split = data_split)
+
+final_model %>%
+  collect_predictions() %>%
+  ggplot(aes(outcome_sr, .pred)) +
+  geom_point(alpha = 3/4) +
+  geom_smooth() +
+  coord_obs_pred() +
+  labs(x = "observed", y = "predicted") +
+  ggthemes::theme_fivethirtyeight()
+
+```
+
+```{r}
+
+# Clustering like predictions
+
+cluster_data <- reformatted %>%
+   dplyr::select(starts_with('.pred'))
+
+group_numeric_features <- function(data) {
+  
+   # Compute the correlation matrix for the numeric features
+   cor_matrix <- cor(data)
+  
+   # Apply hierarchical clustering to the correlation matrix
+   hc_result <- hclust(as.dist(1-cor_matrix), method = 'complete')
+   
+   # Get the feature groups based on the hierarchical clustering
+   feature_groups <- cutree(hc_result, k = 3)
+   
+   # Return the feature groups
+   return(feature_groups)
+   
+}
+
+group_numeric_features(cluster_data)
+
+```
+
+# Study of Dimensionality Reduction
+
+```{r}
+
+# Splits
+set.seed(1)
+data_split <- initial_time_split(data, strata = starts_with('outcome_'))
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+# Folds
+set.seed(2)
+data_folds <- vfold_cv(data_train, strata = starts_with('outcome_'), v = 10, rep = 5)
+  
+# Recipes
+basic_rec <- recipe(outcome_sr ~ ., data = data_train) %>%
+  update_role(starts_with('id_'),
+              new_role = 'id') %>%
+  # Normalize
+  step_normalize(all_numeric_predictors()) %>%
+  # Dummy
+  step_dummy(all_nominal_predictors())
+
+data_train %>%
+  select(where(is.numeric)) %>%
+  correlate() %>%
+  network_plot(colours = c("orange", "white", "midnightblue"))
+
+# PCA
+pca_rec <- basic_rec %>%
+  step_pca(all_numeric_predictors(), num_comp = tune())
+# PLS
+auto_pls <- basic_rec %>%
+  step_pls(all_numeric_predictors(),
+           outcome = 'outcome_sr',
+           num_comp = tune())
+# VIP
+base_model <- rand_forest() %>%
+  set_mode('regression') %>%
+  set_engine("ranger", importance = "permutation")
+vip_rec <- basic_rec %>%
+  step_select_forests(all_numeric_predictors(), 
+                      outcome = 'res', 
+                      threshold = .9)
+# MRMR
+mrmr_rec <- basic_rec %>%
+  step_select_mrmr(all_numeric_predictors(), outcome = 'res',
+                   threshold = .9)
+
+# Trees and rules
+tree <- decision_tree() %>%
+  set_mode('regression')
+svm <- svm_linear() %>%
+  set_mode('regression')
+
+# Workflow
+res <- 
+  workflow_set(
+    preproc = list(
+      baseline = basic_rec,
+      pca = pca_rec,
+      auto_pls = auto_pls),
+    models = list(svm = svm)
+  ) %>% 
+  workflow_map(
+    'tune_race_anova',
+    verbose = TRUE,
+    seed = 1603,
+    resamples = data_folds,
+    grid = 10,
+    control = control_race(pkgs = "colino", parallel_over = 'everything')
+  )
+
+autoplot(res, select_best = T, metric = 'rmse') +
+  geom_text_repel(aes(label = wflow_id)) +
+  theme(legend.position = "none") +
+  ggthemes::theme_fivethirtyeight()
+
+
+final_model <- res %>%
+  extract_workflow('auto_pls_svm') %>%
+  finalize_workflow(extract_workflow_set_result(res, 'auto_pls_svm') %>%
+                      select_best(metric ='rmse')) %>%
+  last_fit(split = data_split)
+
+final_model %>%
+  collect_predictions() %>%
+  ggplot(aes(outcome_sr, .pred)) +
+  geom_point(alpha = 0.5) +
+  coord_obs_pred() +
+  labs(x = "observed", y = "predicted")
+
+```
+
+

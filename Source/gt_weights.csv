@@ -1,0 +1,2 @@
+condition,weight
+wp >= 0.95 | wp <= 0.05,0.55

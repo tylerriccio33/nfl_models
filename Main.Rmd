@@ -1,0 +1,856 @@
+---
+title: "Wrangle and Featuring"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Initialize
+
+```{r}
+
+# Load Libraries
+library(rlang)
+library(glue)
+library(dtplyr)
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(nflreadr)
+
+library(nflModeler)
+
+library(broom)
+library(corrr)
+
+# Set Options
+options(scipen = 999)
+options(dplyr.summarise.inform = FALSE)
+
+# Define Globals
+mode <- 'train_light'
+this_week <- 22
+this_season <- 2022
+seasons <- case_when(mode == 'serve' ~ (this_season - 2),
+                     mode == 'train_light' ~ 2016,
+                     mode == 'train_full' ~ 2006):2022
+
+```
+
+# Add this to nflModeler
+
+```{r}
+
+pivot_home_away <- function(game_key_df, apply_conventions = T) {
+
+  # Collect home prefix
+  home_data <- game_key_df %>%
+    # Set team type
+    mutate(team_type = 'home') %>%
+    # Remove away variables
+    select(-starts_with('away_')) %>%
+    relocate(!starts_with('home_'))
+  
+  if (apply_conventions) {
+    home_data <- home_data %>%
+      # Replace the home with team
+      rename_with( ~ str_replace_all(.x, '^home_', 'team_'),
+                   starts_with('home_')) %>%
+      # Replace everything else with id
+      rename_with( ~ glue("id_{.x}"),!starts_with('team_'))
+  } else {
+    home_data <- home_data %>%
+      rename_with(~ str_remove_all(.x, 'home_'))
+  }
+  
+  # Collect away prefix
+  away_data <- game_key_df %>%
+    # Set team type
+    mutate(team_type = 'away') %>%
+    # Remove away variables
+    select(-starts_with('home_')) %>%
+    relocate(!starts_with('away_')) %>%
+    # Remove home prefix
+    rename_with(~ str_remove_all(.x, '^away_'))
+  
+  if (apply_conventions) {
+    away_data <- away_data %>%
+      # Replace the home with team
+      rename_with( ~ str_replace_all(.x, '^away_', 'team_'),
+                   starts_with('away_')) %>%
+      # Replace everything else with id
+      rename_with( ~ glue("id_{.x}"),!starts_with('team_'))
+    
+  } else {
+    away_data <- away_data %>%
+      rename_with(~ str_remove_all(.x, 'away_data'))
+  }
+  
+  # Bind rows
+  combined_data <- bind_rows(home_data, away_data)
+  # Arrange on game_id if exists
+  # This is not necessary but probably saves code and time
+  if ('id_game_id' %in% colnames(combined_data)) {
+    combined_data <- combined_data %>%
+      rename(id_game = id_game_id) %>%
+      arrange(id_game)
+  }
+  
+  return(combined_data)
+  
+}
+
+
+```
+
+
+## Source Scripts
+
+```{r}
+# Functions
+list.files('Source', pattern = 'R$') %>%
+  paste0('Source/', .) %>%
+  map(source)
+```
+
+## Load Data
+
+```{r}
+
+data <- get_data(seasons = seasons) %>%
+  # Hail Mary Criteria
+  filter(
+    !(
+      half_seconds_remaining <= 10 &
+        pass_attempt == 1 &
+        pass_length == "deep"
+    ),
+    # Last Play Nonsense Criteria!(
+    half_seconds_remaining <= 10 &
+      (lateral_reception == 1 | lateral_rush == 1)
+  )
+)
+
+game_team_info <-nflreadr::load_schedules()
+
+get_game_team_info <- function() {
+  
+  # No seasons parameter because some metrics need to reference entire time frame
+  # For example, coach and QB starts need to consider entire timeline
+  
+  data <-  nflreadr::load_schedules() %>%
+    # Convert to tibble to prevent unexpected coercion from dbplyr, dtplyr
+    as_tibble() %>%
+    pivot_home_away(apply_conventions = T)
+  
+  return(data)
+  
+  
+    # Remove redundant or deprecated variables
+    select(-c(old_game_id,
+              gsis,
+              nfl_detail_id,
+              pfr,
+              pff,
+              espn,
+              stadium,
+              qb_name)) %>%
+    # Reciprocate not obvious team level variables
+    mutate(across(c(result, spread_line), ~ if_else(team_type == 'away', .x * -1, .x)))
+    
+    
+  return(data)
+  
+}
+
+
+game_team_info <- get_game_team_info()
+
+
+
+
+schedule_data <- get_schedule_data() %>%
+  # Only using bare bones
+  select(
+    id_game = game_id,
+    id_posteam = posteam,
+    team_spread_line = spread_line,
+    team_moneyline = moneyline,
+    team_n_coach_starts = n_coach_starts
+  )
+
+game_priors <- get_game_priors() %>%
+  rename(
+    id_game = game_id,
+    id_posteam = posteam,
+    id_playoff = playoff,
+    id_div_game = div_game,
+    id_site = site
+  )
+
+elo_data <- get_elo() %>%
+  # Only using bare bones
+  select(id_game = game_id,
+         id_posteam = posteam,
+         team_elo = elo)
+
+```
+
+# Feature Creation
+
+## Drive Collapsing
+
+### Regular Drive Collapsed Statistics
+
+```{r}
+
+# There are about 10 games where large amounts of drive data is missing
+# This looks like an NFL API error unfortunately
+
+drive_collapsed_regular <- data %>%
+  lazy_dt() %>%
+  # Filtering Distorted Results
+  filter(
+    # Two point attempts
+    two_point_attempt == 0, 
+    !drive_end_transition %in% c(      
+      'end of game',
+      'fumble',
+      'end_game',
+      'end_half',
+      'end of half',
+      'unknown',
+      'fumble_safety',
+      'fumble, safety'
+    ),
+    # Drive end transition is missing for entire games for some reason
+    # I'm removing it as a filter option for now
+    # !is.na(drive_end_transition),
+    rush == 1 | qb_dropback == 1,
+  ) %>%
+  # Cleaning
+  select(game_id, posteam, defteam, drive, wp, wpa) %>%
+  drop_na() %>%
+  # Summarizing
+  group_by(game_id, posteam, defteam, drive) %>%
+  summarize(drive_wpa = sum(last(wp), last(wpa)) - first(wp)) %>%
+  ungroup() %>%
+  # Renaming
+  as_tibble() %>%
+  rename(id_game = game_id) %>%
+  rename_with(~glue("id_{.x}"), c(posteam, defteam))
+
+```
+
+### Drive Collapsed Master
+
+
+```{r}
+master_drive_collapsed <- drive_collapsed_regular %>%
+  left_join(calculate_drive_points_oe(data), by = c('id_game', 'drive'))
+```
+
+## Game Collapsing and Sub Models
+
+### Deriving Priors and Posteriors
+
+```{r}
+
+adjust_success <- function(data) {
+
+  data %>%
+    mutate(
+      weight = case_when(
+        # Scramble
+        qb_scramble == 1 & fumble_lost != 1 ~ 1 + 1.15,
+        # Interception
+        interception == 1 ~ 1 + (-.38),
+        # Non Sack Fumble
+        fumble == 1 & sack == 0 & fumble_lost == 1 ~ 1 + (-.23),
+        # Goaline
+        yardline_100 < 3 & down < 4 ~ 1+-1.34,
+        TRUE ~ 1
+      ),
+      success = weight * success
+    )
+  
+}
+
+res_table <- data %>%
+  rename(id_game = game_id,
+         id_posteam = posteam)%>%
+  # Filter Garbage Time Now
+  # Eventually weighted versions of this should be used
+  filter(!(qtr == 4 & (wp > .9 | wp < .1))) %>%
+  adjust_success() %>%
+  drop_na(id_posteam, success, down, epa) %>%
+  group_by(id_game, id_posteam) %>%
+  summarize(outcome_sr = mean(success)) %>%
+  ungroup() %>%
+  left_join(
+    master_drive_collapsed %>%
+      select(id_game,
+             id_posteam,
+             adj_drive_points) %>%
+      drop_na() %>%
+      group_by(id_game, id_posteam) %>%
+      summarize(points = sum(adj_drive_points)) %>%
+      ungroup() %>%
+      group_by(id_game) %>%
+      group_modify( ~ {
+        p_vector <- .x$points
+        .x %>%
+          mutate(points_allowed = if_else(row_number() == 1, p_vector[2], p_vector[1]))
+      }) %>%
+      ungroup() %>%
+      mutate(points_result = points - points_allowed),
+    by = c('id_game', 'id_posteam')
+  ) %>%
+  # Renaming
+  rename_with(~ glue("team_{.x}"), c(points_result))
+
+# These will ensure they're untouched during mutations
+priors_and_posterior <- schedule_data %>%
+  # Join Game Priors
+  left_join(game_priors, by = c('id_game', 'id_posteam')) %>%
+  # Join ELO Data
+  left_join(elo_data,
+            by = c('id_game', 'id_posteam')) %>%
+  # Result
+  left_join(res_table,
+            by = c('id_game', 'id_posteam'))
+
+```
+
+### Lookups
+
+```{r}
+
+# ELO Added
+# These are game level features so keep it separate
+lookup_elo_added <-
+  read_csv("https://projects.fivethirtyeight.com/nfl-api/nfl_elo.csv") %>%
+  calculate_elo_added(.schedule_data = schedule_data) %>%
+  # Only using bare bones
+  select(
+    id_game = game_id,
+    id_posteam = posteam,
+    team_eloa = eloa,
+    qb_eloa
+  )
+
+```
+
+### Passing Lookup
+
+```{r}
+
+lookup_passing <- data %>%
+  generate_qb_metrics(
+    .this_week = this_week,
+    .this_season = this_season,
+    bypass_warnings = T,
+    return_extra_circumstances = F
+  ) %>%
+  ungroup() %>%
+  select(-gsis) %>%
+  rename_with( ~ glue("qb_{.x}"), .cols = -c(game_id, posteam)) %>%
+  # Mutate Some QB Stats to 0 if NA
+  # Rushing EPA included here because it is reasonable to be neutral
+  # PACR, CPOE and Dakota will be imputed from ELO
+  mutate(across(c(qb_starts, qb_elo, qb_rushing_epa), ~ if_else(is.na(.x),0,.x))) %>%
+  rename(id_game = game_id,
+         id_posteam = posteam)
+
+```
+
+### NGS Receiving
+
+```{r}
+
+lookup_ngs_receiving <- 
+  # Hard code seasons
+  load_nextgen_stats(seasons = 2016:this_season, stat_type = 'receiving') %>%
+  as_tibble() %>%
+  # Cleaning
+  filter(week != 0) %>%
+  select(
+    -c(
+      season_type,
+      player_position,
+      player_first_name,
+      player_last_name,
+      player_jersey_number,
+      player_short_name,
+      player_display_name,
+      player_gsis_id
+    )
+  ) %>%
+  relocate(season, week, posteam = team_abbr) %>%
+    rename_with(~ str_replace_all(.x, 'avg_','')) %>%
+    # Fixing team name
+  dplyr::mutate(
+    posteam = gsub("WSH", "WAS", posteam),
+    posteam = gsub("LAR", "LA", posteam),
+  ) %>%
+  # Aggregating
+  group_by(season, week, posteam) %>%
+  summarize(# Un-weighted, independent metrics
+    across(c(cushion, separation), ~ mean(.x)),
+    # Target weighted
+    across(
+      c(
+        intended_air_yards,
+        percent_share_of_intended_air_yards,
+        catch_percentage
+      ),
+      ~ weighted.mean(.x, targets)
+    ),
+    # Reception weighted
+    across(
+      c(yac, expected_yac, yac_above_expectation),
+      ~ weighted.mean(.x, receptions)
+    )
+    ) %>%
+  ungroup() %>%
+  rename(id_season = season, id_week = week, id_posteam = posteam)
+
+
+```
+
+### NGS Rushing[Beta]
+
+```{r}
+
+if(F) {
+rb_vector <- load_players() %>%
+  as_tibble() %>%
+  filter(position == 'RB') %>%
+  pull(gsis_id)
+
+lookup_ngs_rushing <-
+  # Hard code seasons
+  load_nextgen_stats(seasons = 2016:2022, stat_type = 'rushing') %>%
+  as_tibble() %>%
+  # Cleaning
+  filter(week != 0) %>% # These are seasonal aggregates
+  # Remove non running backs
+  # In the future, I could expand these to jet streams, orbits
+  filter(player_gsis_id %in% rb_vector) %>%
+  select(
+    -c(
+      season_type,
+      player_position,
+      player_first_name,
+      player_last_name,
+      player_jersey_number,
+      player_short_name,
+      player_display_name,
+      player_gsis_id
+    )
+  ) %>%
+  relocate(season, week, posteam = team_abbr) %>%
+  # Fixing team name
+  dplyr::mutate(
+    posteam = gsub("WSH", "WAS", posteam),
+    posteam = gsub("LAR", "LA", posteam),
+  ) %>%
+  # These are mostly empty from 2016:2017
+  # Eventually I'll probably impute these
+  # I think some of these are just linear models
+  select(
+    -c(expected_rush_yards,
+      rush_yards_over_expected,
+      rush_yards_over_expected_per_att,
+      rush_pct_over_expected)
+  ) %>%
+  # Aggregating
+  group_by(season, week, posteam) %>%
+  summarize(# Attempt Weighted
+    across(
+      c(
+        efficiency,
+        percent_attempts_gte_eight_defenders,
+        avg_time_to_los,
+        avg_rush_yards
+      ),
+      ~ weighted.mean(.x, rush_attempts)
+    ),
+    n = sum(rush_attempts)) %>%
+  ungroup() %>%
+  rename_with(~ glue("rush_{.x}"), .cols = -c(season, week, posteam))
+
+rm(rb_vector)
+
+}
+
+```
+
+### Offensive Game Collapsing
+
+```{r}
+
+offense_game_collapsed <- data %>%
+  rename(id_game = game_id) %>%
+  rename_with(~ glue("id_{.x}"), .cols = c(posteam, defteam, season, week)) %>%
+  # Drop NA on some column
+  drop_na(starts_with('id_'), epa, ep, wp, down, qb_dropback) %>%
+  # Base Filters
+  filter(
+    two_point_attempt == 0, # 2PA
+    play_type %in% c('run','pass'), # Only normal plays
+    qb_kneel != 1, # QB Kneels
+    qb_spike != 1, # QB Spikes
+    ) %>%
+  # Weighting
+  adjust_success() %>%
+  ## Regular Game Collapsing
+  group_by(id_game, id_posteam, id_defteam, id_season, id_week) %>%
+  summarize(
+    n = n(),
+    pass_success = mean(success[qb_dropback==1]),
+            rush_success = mean(success[qb_dropback ==0]),
+            epa = mean(epa),
+    team_wp = mean(wp),
+      sr = mean(success)) %>%
+  ungroup() %>%
+  # Joining to collapsed master drive
+  left_join(master_drive_collapsed %>%
+      group_by(id_game, id_posteam) %>%
+  summarize(
+    drive_wpa = mean(drive_wpa, na.rm = T),
+    drive_points_oe = mean(drive_points_oe, na.rm = T)
+  ) %>%
+  ungroup(),
+            by = c('id_game', 'id_posteam')) %>%
+  # ELO Added
+  left_join(lookup_elo_added, by = c('id_game', 'id_posteam')) %>%
+  # Binding to Corrected Result
+  left_join(
+    res_table %>% select(id_game, id_posteam, team_points_result, points),
+    by = c('id_game', 'id_posteam')
+  ) %>%
+  # Look up on NGS Receiving
+  left_join(lookup_ngs_receiving, by = c('id_posteam','id_season','id_week')) %>%
+  # Some older data has duplicate games
+  group_by(id_game) %>%
+  filter(n() == 2) %>%
+  ungroup() %>%
+  # Reversing unit features
+  reverse_feature(c(
+    where(is.numeric),
+    -n,
+    -starts_with('id_'),
+    -starts_with('team_')
+  )) %>%
+  # Calculate over expected
+  over_expected(where(is.numeric),
+                -n,
+                -starts_with('team_'),
+                -starts_with('id_'),
+                team_stat = F) %>%
+  over_expected(starts_with('team_'), team_stat = T)
+  
+```
+
+## Rolling Averages
+
+```{r}
+
+new_week <- schedule_data %>%
+  separate(
+    col = id_game,
+    into = c('id_season', 'id_week', 'id_posteam_2', 'id_defteam_2'),
+    sep = '_',
+    remove = F
+  )  %>%
+  select(-c(ends_with('_2'),-id_defteam_2,-id_posteam_2)) %>%
+  filter(id_season == this_season,
+         id_week == this_week) %>%
+  mutate(id_season = as.numeric(id_season),
+         id_week = as.numeric(id_week),
+         id_defteam = if_else(id_posteam == id_posteam_2, id_defteam_2, id_posteam_2)) %>%
+  select(id_game,
+         id_posteam,
+         id_defteam,
+         id_season,
+         id_week,
+         team_spread_line,
+         team_moneyline,
+         team_n_coach_starts)
+
+new_week
+
+```
+
+```{r}
+
+rolling_average <- function(x, window_size) {
+  n <- n()
+  window_size <- min(window_size, n)
+  cum_avg <- cumsum(na.omit(x)) / (1:n)
+  roll_avg <- ifelse(
+    1:n < window_size,
+    cum_avg[1:n],
+    zoo::rollmean(
+      x,
+      window_size,
+      align = "right",
+      fill = NA,
+      na.rm = TRUE
+    )
+  )
+  return(roll_avg)
+}
+
+rolled <- offense_game_collapsed %>%
+  bind_rows(select(new_week, id_game, id_posteam, id_season, id_week)) %>%
+  # Remove clinched teams
+  remove_clinched_teams() %>% 
+  # Rolling
+  group_by(id_posteam) %>%
+  arrange(id_season, id_week, .by_group = T) %>%
+  
+  mutate(across(c(where(is.numeric),-c(starts_with('id_'), n)),
+                ~ lag(rolling_average(.x * n, window_size = 15)))) %>%
+  ungroup() %>%
+  # Removing play counts
+  select(-n)
+
+rolled %>%
+  # Investigate these
+  drop_na() %>%
+  group_by(id_game, id_posteam) %>%
+  filter(n() == 1) %>%
+  ungroup() %>%
+  # Joining to Priors
+  left_join(
+    select(
+      priors_and_posterior,
+      id_game,
+      id_posteam,
+      team_spread_line,
+      team_moneyline,
+      team_elo,
+      starts_with('outcome')),
+      by = c('id_game', 'id_posteam')
+    ) %>% 
+  select(-c(
+    id_game,
+    id_posteam,
+    id_defteam,
+    id_season,
+    id_week
+  )) %>%
+  relocate(starts_with('outcome')) %>%
+  correlate() %>% view()
+  summarize(mean(abs(outcome_sr), na.rm = T))
+  
+```
+
+```{r}
+
+pivoted <- rolled %>%
+  # Self Join
+  inner_join(
+    y =  select(
+      .,
+      id_game,
+      id_posteam = id_defteam,
+      ends_with('_allowed'),
+      starts_with('team_')
+    ) %>%
+      rename_with(
+        ~ glue("{str_replace_all(.x, '_allowed','')}_opponent"),
+        -c(id_game, id_posteam)
+      ),
+    by = c('id_game', 'id_posteam')
+  ) %>%
+  # Remove Allowed since it's no longer needed
+  select(-contains('allowed')) %>%
+  # Joining to final result
+  left_join(select(res_table, id_game, id_posteam, starts_with('outcome_')),
+            by = c('id_game', 'id_posteam')) %>%
+  relocate(id_game, id_posteam, id_defteam, id_season, id_week, starts_with('outcome_'))
+
+
+```
+
+# Interactions and Processing
+
+## Interactions
+
+```{r}
+
+# This takes a really long time to run
+like_opponent_differential <- data %>%
+  rename(id_game = game_id) %>%
+  rename_with(~ glue("id_{.x}"), .cols = c(posteam, defteam, season, week)) %>%
+  bind_rows(new_week) %>%
+  # This is reducing the data to get the normal result
+  calculate_like_opponent_differential()
+
+# Interacting
+interacted <- pivoted %>%
+  # Unit Level Interactions
+  interact_metrics(c(
+    where(is.numeric),-c(
+      starts_with('team_'),
+      starts_with('id_'),
+      starts_with('outcome_'),
+      ends_with('_opponent')
+    )
+  ),
+  mode = 'unit')  %>%
+  # Team Level Interactions
+  interact_metrics(c(starts_with('team_'),-ends_with('_opponent')),
+                   mode = 'team') %>%
+  # Join to QB Lookup
+  left_join(lookup_passing, by = c('id_game', 'id_posteam')) %>%
+  # Mutate Some QB Stats to 0 if NA
+  # I already did this in the lookup table but not all QBs match
+  # Rushing EPA included here because it is reasonable to be neutral
+  # PACR, CPOE and Dakota will be imputed from ELO
+  mutate(across(c(qb_starts, qb_elo, qb_rushing_epa), ~ if_else(is.na(.x), 0, .x))) %>%
+  # Join to like result
+  left_join(select(like_opponent_differential,-id_defteam),
+            by = c('id_game', 'id_posteam')) %>%
+  # Including Eras
+  mutate(
+    era = case_when(
+      id_season %in% c(2006:2007) ~ 1,
+      # Initial Inaccuracies
+      id_season %in% c(2008:2013) ~ 2,
+      # Second Era
+      id_season %in% c(2014:2016) ~ 3,
+      # Third Era
+      id_season %in% c(2016:2018) ~ 4,
+      # NGS Data
+      TRUE ~ 5
+    ),
+    # Current Era
+    # Forcing era to Factor
+    era = as.factor(era),
+    # Forcing NAN to NA
+    # Intended for NGS data
+    across(everything(), ~ if_else(is.nan(.x), NA, .x))
+  )
+
+  interacted %>%
+    correlate() %>%
+    relocate(term, starts_with('outcome_')) %>%
+    view()
+
+write(interacted)
+
+```
+
+# Model Serving
+
+```{r}
+
+library(tidymodels)
+
+serve_week <- interacted %>%
+  filter(id_season == this_season,
+         id_week == this_week) %>%
+    mutate(era = as.factor(era))
+
+preds <- bind_cols(
+  # RF
+  read_rds('rec_boost_tree.rds') %>%
+    predict(new_data = new_week),
+  # Cubist
+  read_rds('rec_linear_reg.rds') %>%
+    predict(new_data = new_week),
+  # SVM
+  read_rds('rec_mlp.rds') %>%
+    predict(new_data = new_week)
+) %>%
+  rename(xgb = 1,
+         glmnet = 2,
+         mlp = 3) %>%
+  bind_cols(new_week) %>%
+  rowwise() %>%
+  mutate(blend_pred = mean(c_across(c(xgb, glmnet, mlp)))) %>%
+  ungroup() %>%
+  mutate(across(c(xgb, glmnet, mlp), ~ round(.x, digits  = 1)))
+
+```
+
+```{r}
+
+library(gt)
+library(gtExtras)
+library(ggrepel)
+library(ggthemes)
+
+# Give Predictions
+
+preds %>%
+  select(
+    team = id_posteam,
+    opponent = defteam,
+    spread = spread_line,
+    moneyline = moneyline,
+    elo = elo,
+    'Spicy' = rf,
+    'Safe' = bart,
+    'All Considered' = svm
+  ) %>%
+  gt() %>%
+  # Spanners
+  gt::tab_spanner(label = 'Teams', columns = c(team, opponent)) %>%
+  gt::tab_spanner(label = 'Priors', columns = c(spread, moneyline, elo)) %>%
+  gt::tab_spanner(
+    label = 'Model Predictions',
+    columns = c(Spicy, Safe, 'All Considered',)
+  ) %>%
+  # Title
+  tab_header(title = 'NFL Game Predictions',
+             subtitle = glue("Season: {this_season}, Week: {this_week}")) %>%
+  gt_theme_538()
+
+# Power Rankings
+
+rolled %>%
+  filter(season == this_season,
+         week == this_week)  %>%
+  arrange(-pythag_points) %>%
+  mutate(rank = row_number()) %>%
+  select(team = id_posteam, rank, raw = pythag_points) %>%
+  gt() %>%
+  # Header
+  tab_header(title = 'Power Rankings',
+             subtitle = glue("Season: {this_season}, Week: {this_week}")) %>%
+  # Theme
+  gt_theme_538()
+  
+rolled %>%
+  filter(season == this_season,
+         id_posteam %in% c(preds$id_posteam, preds$defteam)) %>%
+  select(id_posteam, week, pythag_points) %>%
+  group_by(id_posteam) %>%
+  mutate(label = if_else(week == max(week), id_posteam, NA_character_)) %>%
+  ungroup() %>%
+  ggplot(aes(week, pythag_points, color = id_posteam)) +
+  geom_line() +
+  geom_label_repel(aes(label = label),
+                   nudge_x = 1,
+                   na.rm = TRUE) +
+  labs(title = glue("Rankings by Week for {this_season}")) +
+  ggthemes::theme_fivethirtyeight() +
+  theme(legend.position = "none")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
